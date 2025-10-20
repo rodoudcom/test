@@ -4,399 +4,349 @@ namespace App\WorkflowRodoud;
 
 
 
-use function Amp\async;
-use function Amp\Future\awaitAll;
-/**
- * Workflow executor with advanced features
- *
- * SUPPORTS TWO APPROACHES:
- * 1. Instance-based: addStep($service, 'method', ...) - for Symfony DI
- * 2. String-based: addStep('ServiceClass.method', ...) - for JSON persistence
- */
+use App\WorkflowRodoud\Contracts\JobInterface;
+use App\WorkflowRodoud\Contracts\WorkflowSummaryCallbackInterface;
+use App\WorkflowRodoud\Attributes\Job;
+use App\WorkflowRodoud\Services\WorkflowRedisTracker;
+use ReflectionClass;
+
 class Workflow
 {
+    private string $id;
     private array $steps = [];
-    private WorkflowContext $context;
-    private int $stepCounter = 0;
-    private array $executionOrder = [];
-    private array $serviceRegistry = []; // Maps service names to instances
+    private array $connections = [];
+    private array $globals = [];
+    private array $results = [];
+    private ?WorkflowRedisTracker $tracker = null;
+    private ?WorkflowSummaryCallbackInterface $summaryCallback = null;
+    private string $name;
+    private ?string $description = null;
+    private float $startTime;
+    private int $startMemory;
 
-    public function __construct()
+    public function __construct(?string $name = null, ?string $description = null)
     {
-        $this->context = new WorkflowContext();
+        $this->id = $this->generateUuid();
+        $this->name = $name ?? 'workflow_' . $this->id;
+        $this->description = $description;
     }
 
-    /**
-     * Register a service instance for string-based job references
-     *
-     * @param string $name Service identifier (e.g., 'wordpress', 'processor')
-     * @param object $instance The service instance
-     */
-    public function registerService(string $name, object $instance): self
+    public function setTracker(WorkflowRedisTracker $tracker): self
     {
-        $this->serviceRegistry[$name] = $instance;
+        $this->tracker = $tracker;
         return $this;
     }
 
-    /**
-     * Register multiple services at once
-     */
-    public function registerServices(array $services): self
+    public function setSummaryCallback(WorkflowSummaryCallbackInterface $callback): self
     {
-        foreach ($services as $name => $instance) {
-            $this->registerService($name, $instance);
-        }
+        $this->summaryCallback = $callback;
         return $this;
-    }
-
-    /**
-     * Add a step - SUPPORTS MULTIPLE FORMATS
-     *
-     * Format 1 (Instance): addStep($serviceInstance, 'methodName', [...])
-     * Format 2 (String): addStep('serviceName.methodName', [...])
-     * Format 3 (Class): addStep('ClassName.methodName', [...])
-     *
-     * @param string $job Service instance, service name, or class name
-     * @param Object $jobProvider Method name
-     * @param array $inputs Input parameters (only if second param is method name)
-     * @param string $stepId Optional step ID
-     * @param array $dependsOn Dependencies
-     * @param bool $parallel Can run in parallel
-     * @param bool $stopOnError stop all workflow when a step have an error
-     */
-    public function addStep(
-        string $stepId,
-        object $jobProvider,
-        string $job = "",
-        array  $inputs = [],
-        array  $dependsOn = [],
-        bool   $parallel = false,
-        bool   $stopOnError = true,
-    ): self
-    {
-
-
-        if (!method_exists($jobProvider, $job)) {
-            throw new \InvalidArgumentException("Method '{$job}' does not exist on " . get_class($jobProvider));
-        }
-
-
-        $config = new StepConfig($stepId, $jobProvider, $job);
-        $config->inputs = $inputs;
-        $config->dependsOn = $dependsOn;
-        $config->parallel = $parallel;
-        $config->stopOnError = $stopOnError;
-
-        $this->steps[$stepId] = $config;
-
-        return $this;
-    }
-
-    /**
-     * Configure retry for the last added step
-     */
-    public function withRetry(int $maxAttempts, float $baseDelay = 1.0, float $multiplier = 2.0): self
-    {
-        $lastStep = end($this->steps);
-        if ($lastStep) {
-            $lastStep->retry = new RetryConfig($maxAttempts, $baseDelay, $multiplier);
-        }
-        return $this;
-    }
-
-    /**
-     * Configure stopOnError for the last added step
-     */
-    public function setStopOnError(bool $stopOnError): self
-    {
-        /**
-         * @var StepConfig $lastStep
-         */
-        $lastStep = end($this->steps);
-        if ($lastStep) {
-            $lastStep->stopOnError = $stopOnError;
-        }
-        return $this;
-    }
-
-    /**
-     * Add decider to last step for conditional routing
-     */
-    public function withDecider(callable $configCallback): self
-    {
-        $lastStep = end($this->steps);
-        if ($lastStep) {
-            $decider = new DeciderConfig();
-            $configCallback($decider);
-            $lastStep->decider = $decider;
-        }
-        return $this;
-    }
-
-    /**
-     * Get the last added step config for advanced configuration
-     */
-    public function getLastStep(): ?StepConfig
-    {
-        return end($this->steps) ?: null;
-    }
-
-    private function generateStepId(string $jobName): string
-    {
-        return str_replace('.', '_', $jobName) . '_' . (++$this->stepCounter);
     }
 
     public function setGlobals(array $globals): self
     {
-        foreach ($globals as $key => $value) {
-            $this->context->setGlobal($key, $value);
-        }
+        $this->globals = $globals;
         return $this;
     }
 
-    /**
-     * Execute workflow with dependency resolution
-     */
-    public function execute(): WorkflowContext
+    public function addStep(string $stepId, JobInterface $job, array $inputs = []): self
     {
-        // 1) Build execution order (batches)
-        $this->executionOrder = $this->resolveExecutionOrder();
+        $jobName = $this->extractJobName($job);
 
-        // 2) For each batch, run parallel steps as async jobs and run non-parallel steps directly
-        foreach ($this->executionOrder as $batch) {
-            $futures = []; // keyed by stepId => Future
+        $this->steps[$stepId] = [
+            'id' => $stepId,
+            'job' => $job,
+            'name' => $jobName,
+            'inputs' => $inputs,
+            'dependencies' => []
+        ];
 
-            // First, start ALL parallel jobs in this batch
-            foreach ($batch as $stepId) {
-                /** @var StepConfig $step */
-                $step = $this->steps[$stepId];
-
-                if ($step->parallel) {
-                    // Create future for parallel execution
-                    $futures[$stepId] = async(function () use ($step) {
-                        return $this->executeStepWithRetry($step);
-                    });
-                }
-            }
-
-            // Then execute non-parallel jobs
-            foreach ($batch as $stepId) {
-                /** @var StepConfig $step */
-                $step = $this->steps[$stepId];
-
-                if (!$step->parallel) {
-                    $result = $this->executeStepWithRetry($step);
-                    $this->context->setResult($stepId, $result);
-
-                    if ($step->stopOnError && !empty($result->errors)) {
-                        return $this->context;
-                    }
-                }
-            }
-
-            // 3) Wait for all parallel futures to finish and collect results
-            if (!empty($futures)) {
-                // awaitAll returns array of arrays: [0 => [results...], 1 => [results...]]
-                // Each inner array contains the actual results
-                $awaitedResults = awaitAll($futures);
-
-                // Get the step IDs in the same order as $futures
-                $stepIds = array_keys($futures);
-
-                // Flatten and map results back to step IDs
-                foreach ($awaitedResults as $groupIndex => $group) {
-                    // $group should contain one result per future
-                    foreach ($group as $stepId => $result) {
-
-                        // result should be a JobResult instance
-                        if ($result instanceof JobResult) {
-                            $this->context->setResult($stepId, $result);
-                        } else {
-                            // Defensive: if a task returned unexpected value, wrap it
-                            $jr = new JobResult($stepId, (is_object($result) ? get_class($result) : 'parallel'));
-                            $jr->finish(is_array($result) ? $result : ['result' => $result]);
-                            $this->context->setResult($stepId, $jr);
-                            $result = $jr;
-                        }
-
-                        if ($this->steps[$stepId]->stopOnError && !empty($result->errors)) {
-                            return $this->context;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4) Return context with all results
-        return $this->context;
-    }
-    /**
-     * Execute a step with retry logic
-     */
-    private function executeStepWithRetry(StepConfig $step): JobResult
-    {
-        $attempt = 1;
-        $lastResult = null;
-
-        while ($attempt <= $step->retry->maxAttempts) {
-            $jobName = is_object($step->jobProvider) ? get_class($step->jobProvider) . '.' . $step->job : $step->jobProvider;
-
-            $result = new JobResult($step->id, $jobName);
-            $result->attemptNumber = $attempt;
-
-            // Resolve inputs
-            $resolvedInputs = $this->context->resolveInputs($step->inputs);
-            $result->input = $resolvedInputs;
-
-            $result->addLog("Attempt {$attempt} of {$step->retry->maxAttempts}");
-
-            try {
-                // Execute the job
-
-                // Execute on instance
-                $output = $step->jobProvider->{$step->job}($this->context, $result, $resolvedInputs);
-
-
-                // Ensure output is always an array
-                if (!is_array($output)) {
-                    $output = ['result' => $output];
-                }
-
-                $result->finish($output);
-
-                // Check if job indicated failure through errors array
-                if (empty($result->errors)) {
-                    // Success! Store and return
-                    $result->addLog("Attempt {$attempt} succeeded");
-                    $this->context->setResult($step->id, $result);
-                    return $result;
-                }
-
-                // Job added errors, treat as failure
-                $result->addLog("Attempt {$attempt} failed with errors");
-
-            } catch (\Throwable $e) {
-                $result->addError("Exception: " . $e->getMessage());
-                $result->addLog("Attempt {$attempt} threw exception: " . $e->getMessage());
-                $result->finish([]);
-            }
-
-            $lastResult = $result;
-
-            // If not the last attempt, wait before retry
-            if ($attempt < $step->retry->maxAttempts) {
-                $delay = $step->retry->getDelay($attempt);
-                $result->addLog("Waiting {$delay}s before retry...");
-                usleep((int)($delay * 1000000));
-            }
-
-            $attempt++;
-        }
-
-        // All retries exhausted
-        $lastResult->addLog("All {$step->retry->maxAttempts} attempts exhausted");
-        $this->context->setResult($step->id, $lastResult);
-        return $lastResult;
+        return $this;
     }
 
-    /**
-     * Resolve execution order based on dependencies
-     * Returns array of batches (steps that can run in parallel)
-     */
-    private function resolveExecutionOrder(): array
+    public function connect(string $fromNodeId, string $toNodeId): self
     {
-        $graph = [];
-        $inDegree = [];
-
-        // Build dependency graph
-        foreach ($this->steps as $stepId => $step) {
-            $graph[$stepId] = $step->dependsOn;
-            $inDegree[$stepId] = count($step->dependsOn);
+        if (!isset($this->steps[$fromNodeId])) {
+            throw new \InvalidArgumentException("Step '$fromNodeId' does not exist");
         }
 
-        $batches = [];
-        $executed = [];
-
-        while (count($executed) < count($this->steps)) {
-            $batch = [];
-
-            // Find all steps with no pending dependencies
-            foreach ($this->steps as $stepId => $step) {
-                if (in_array($stepId, $executed)) {
-                    continue;
-                }
-
-                $canExecute = true;
-                foreach ($step->dependsOn as $dep) {
-                    if (!in_array($dep, $executed)) {
-                        $canExecute = false;
-                        break;
-                    }
-                }
-
-                if ($canExecute) {
-                    $batch[] = $stepId;
-                }
-            }
-
-            if (empty($batch)) {
-                throw new \RuntimeException("Circular dependency detected or missing dependency");
-            }
-
-            $batches[] = $batch;
-            $executed = array_merge($executed, $batch);
+        if (!isset($this->steps[$toNodeId])) {
+            throw new \InvalidArgumentException("Step '$toNodeId' does not exist");
         }
 
-        return $batches;
+        $this->connections[] = [
+            'from' => $fromNodeId,
+            'to' => $toNodeId
+        ];
+
+        $this->steps[$toNodeId]['dependencies'][] = $fromNodeId;
+
+        return $this;
     }
 
-    public function getContext(): WorkflowContext
+    public function execute(): array
     {
-        return $this->context;
+        $this->startTime = microtime(true);
+        $this->startMemory = memory_get_usage(true);
+
+        if ($this->tracker) {
+            $this->tracker->initWorkflow($this->id, [
+                'name' => $this->name,
+                'description' => $this->description,
+                'total_steps' => count($this->steps)
+            ]);
+        }
+
+        try {
+            if ($this->tracker) {
+                $this->tracker->updateStatus($this->id, 'running');
+            }
+
+            $executionOrder = $this->buildExecutionOrder();
+
+            foreach ($executionOrder as $stepId) {
+                $this->executeStep($stepId);
+            }
+
+            if ($this->tracker) {
+                $this->tracker->updateStatus($this->id, 'completed');
+            }
+
+            $summary = $this->generateSummary();
+
+            if ($this->summaryCallback) {
+                $this->summaryCallback->handle($summary);
+            }
+
+            return $this->results;
+
+        } catch (\Throwable $e) {
+            if ($this->tracker) {
+                $this->tracker->updateStatus($this->id, 'failed');
+            }
+
+            throw $e;
+        }
+    }
+
+    private function executeStep(string $stepId): void
+    {
+        $step = $this->steps[$stepId];
+        $job = $step['job'];
+        $jobName = $step['name'];
+
+        $resolvedInputs = $this->resolveInputs($step['inputs']);
+
+        // Validate inputs - skip if validation fails
+        if (!$job->validateInputs($resolvedInputs)) {
+            if ($this->tracker) {
+                $this->tracker->skipJob($this->id, $jobName, $resolvedInputs, 'validation_failed');
+            }
+            $this->results[$stepId] = ['skipped' => true, 'reason' => 'validation_failed'];
+            return;
+        }
+
+        if ($this->tracker) {
+            $this->tracker->startJob($this->id, $jobName, $resolvedInputs);
+        }
+
+        try {
+            $result = $job->execute($resolvedInputs, $this->globals);
+            $this->results[$stepId] = $result;
+
+            if ($this->tracker) {
+                $this->tracker->completeJob($this->id, $jobName, $result, $resolvedInputs, $job->getLogs());
+            }
+
+        } catch (\Throwable $e) {
+            if ($this->tracker) {
+                $this->tracker->failJob($this->id, $jobName, $e, $resolvedInputs, $job->getLogs());
+            }
+
+            throw $e;
+        }
+    }
+
+    private function resolveInputs(array $inputMapping): array
+    {
+        $resolved = [];
+
+        foreach ($inputMapping as $inputKey => $mapping) {
+            if (is_array($mapping) && count($mapping) === 1) {
+                $stepId = array_key_first($mapping);
+                $resultKey = $mapping[$stepId];
+
+                if (isset($this->results[$stepId])) {
+                    $stepResult = $this->results[$stepId];
+
+                    if (is_array($stepResult) && isset($stepResult[$resultKey])) {
+                        $resolved[$inputKey] = $stepResult[$resultKey];
+                    } else {
+                        $resolved[$inputKey] = $stepResult;
+                    }
+                }
+            } else {
+                $resolved[$inputKey] = $mapping;
+            }
+        }
+
+        return $resolved;
+    }
+
+    private function buildExecutionOrder(): array
+    {
+        $order = [];
+        $visited = [];
+        $temp = [];
+
+        $visit = function($stepId) use (&$visit, &$order, &$visited, &$temp) {
+            if (isset($temp[$stepId])) {
+                throw new \RuntimeException("Circular dependency detected at step: $stepId");
+            }
+
+            if (isset($visited[$stepId])) {
+                return;
+            }
+
+            $temp[$stepId] = true;
+
+            foreach ($this->steps[$stepId]['dependencies'] as $depId) {
+                $visit($depId);
+            }
+
+            unset($temp[$stepId]);
+            $visited[$stepId] = true;
+            $order[] = $stepId;
+        };
+
+        foreach (array_keys($this->steps) as $stepId) {
+            if (!isset($visited[$stepId])) {
+                $visit($stepId);
+            }
+        }
+
+        return $order;
+    }
+
+    private function extractJobName(JobInterface $job): string
+    {
+        if (method_exists($job, 'getName')) {
+            return $job->getName();
+        }
+
+        $reflection = new ReflectionClass($job);
+        $attributes = $reflection->getAttributes(Job::class);
+
+        if (!empty($attributes)) {
+            $jobAttribute = $attributes[0]->newInstance();
+            return $jobAttribute->name;
+        }
+
+        return basename(str_replace('\\', '/', get_class($job)));
+    }
+
+    public function generateSummary(): array
+    {
+        $trackerData = $this->tracker ? $this->tracker->getWorkflowData($this->id) : [];
+
+        $endTime = microtime(true);
+        $endMemory = memory_get_usage(true);
+
+        return [
+            'workflow_id' => $this->id,
+            'name' => $this->name,
+            'description' => $this->description,
+            'status' => $trackerData['status'] ?? 'completed',
+            'started_at' => $trackerData['started_at'] ?? null,
+            'completed_at' => $trackerData['completed_at'] ?? null,
+            'performance' => [
+                'total_execution_time' => round($endTime - $this->startTime, 4),
+                'total_memory_used' => $endMemory - $this->startMemory,
+                'peak_memory' => memory_get_peak_usage(true),
+                'start_memory' => $this->startMemory
+            ],
+            'steps' => array_map(function($step) {
+                return [
+                    'id' => $step['id'],
+                    'name' => $step['name'],
+                    'dependencies' => $step['dependencies']
+                ];
+            }, $this->steps),
+            'connections' => $this->connections,
+            'executed_jobs' => $trackerData['executed_jobs'] ?? [],
+            'results' => $this->results
+        ];
     }
 
     public function getSummary(): array
     {
-        $results = $this->context->getAllResults();
-        $summary = [
-            'total_steps' => count($results),
-            'successful' => 0,
-            'failed' => 0,
-            'total_duration' => 0,
-            'execution_order' => $this->executionOrder,
-            'steps' => []
-        ];
-
-        foreach ($results as $stepId => $result) {
-            if ($result->status === 'success') {
-                $summary['successful']++;
-            } else {
-                $summary['failed']++;
-            }
-
-            $summary['total_duration'] += $result->duration;
-            $summary['steps'][$stepId] = [
-                'job_name' => $result->jobName,
-                'status' => $result->status,
-                'duration' => round($result->duration, 4),
-                'attempts' => $result->attemptNumber,
-                'errors' => $result->errors,
-                'logs' => $result->logs,
-               // 'output_keys' => array_keys($result->output)
-                'output' => $result->output
-            ];
-        }
-
-        return $summary;
+        return $this->generateSummary();
     }
 
-
-    public function reset(): self
+    public function getId(): string
     {
-        $this->steps = [];
-        $this->context = new WorkflowContext();
-        $this->stepCounter = 0;
-        $this->executionOrder = [];
-        return $this;
+        return $this->id;
+    }
+
+    public static function fromJson(string $json, array $jobRegistry = []): self
+    {
+        $config = json_decode($json, true);
+
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new \InvalidArgumentException('Invalid JSON: ' . json_last_error_msg());
+        }
+
+        $workflow = new self(
+            $config['name'] ?? null,
+            $config['description'] ?? null
+        );
+
+        foreach ($config['nodes'] ?? [] as $node) {
+            $jobClass = $node['job_class'] ?? null;
+
+            if (!$jobClass || !isset($jobRegistry[$jobClass])) {
+                throw new \InvalidArgumentException("Job class not found in registry: $jobClass");
+            }
+
+            $job = $jobRegistry[$jobClass];
+            $workflow->addStep($node['id'], $job, $node['inputs'] ?? []);
+        }
+
+        foreach ($config['connections'] ?? [] as $connection) {
+            $workflow->connect($connection['from'], $connection['to']);
+        }
+
+        return $workflow;
+    }
+
+    public function toJson(): string
+    {
+        $config = [
+            'id' => $this->id,
+            'name' => $this->name,
+            'description' => $this->description,
+            'nodes' => array_map(function($step) {
+                return [
+                    'id' => $step['id'],
+                    'job_class' => get_class($step['job']),
+                    'name' => $step['name'],
+                    'inputs' => $step['inputs']
+                ];
+            }, array_values($this->steps)),
+            'connections' => $this->connections
+        ];
+
+        return json_encode($config, JSON_PRETTY_PRINT);
+    }
+
+    private function generateUuid(): string
+    {
+        return sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+            mt_rand(0, 0xffff), mt_rand(0, 0xffff),
+            mt_rand(0, 0xffff),
+            mt_rand(0, 0x0fff) | 0x4000,
+            mt_rand(0, 0x3fff) | 0x8000,
+            mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
+        );
     }
 }
