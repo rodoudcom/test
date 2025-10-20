@@ -3,345 +3,412 @@
 namespace App\WorkflowRodoud;
 
 
-
 use App\WorkflowRodoud\Contracts\JobInterface;
 use App\WorkflowRodoud\Contracts\WorkflowSummaryCallbackInterface;
 use App\WorkflowRodoud\Attributes\Job;
 use App\WorkflowRodoud\Services\WorkflowRedisTracker;
 use ReflectionClass;
 
+/**
+ * Workflow - Main workflow execution engine
+ *
+ * PRIMARY: Works with in-memory WorkflowContext
+ * OPTIONAL: Syncs to Redis via WorkflowRedisTracker for real-time debugging
+ */
 class Workflow
 {
-    private string $id;
-    private array $steps = [];
-    private array $connections = [];
-    private array $globals = [];
-    private array $results = [];
+    private WorkflowContext $context;
     private ?WorkflowRedisTracker $tracker = null;
+    private array $steps = [];
+    private array $stepDependencies = [];
+    private array $connections = [];
     private ?WorkflowSummaryCallbackInterface $summaryCallback = null;
-    private string $name;
-    private ?string $description = null;
     private float $startTime;
-    private int $startMemory;
 
-    public function __construct(?string $name = null, ?string $description = null)
+    public function __construct(string $name)
     {
-        $this->id = $this->generateUuid();
-        $this->name = $name ?? 'workflow_' . $this->id;
-        $this->description = $description;
+        $workflowId = $this->generateWorkflowId();
+        $this->context = new WorkflowContext($workflowId, $name);
     }
 
+    // ============================================
+    // CONFIGURATION
+    // ============================================
+
+    /**
+     * Set optional Redis tracker for real-time monitoring
+     */
     public function setTracker(WorkflowRedisTracker $tracker): self
     {
         $this->tracker = $tracker;
         return $this;
     }
 
+    /**
+     * Set global variables accessible to all jobs
+     */
+    public function setGlobals(array $globals): self
+    {
+        $this->context->setGlobals($globals);
+        $this->syncToRedis();
+        return $this;
+    }
+
+    /**
+     * Set workflow description
+     */
+    public function setDescription(string $description): self
+    {
+        $this->context->setDescription($description);
+        $this->syncToRedis();
+        return $this;
+    }
+
+    /**
+     * Set callback to persist workflow result
+     */
     public function setSummaryCallback(WorkflowSummaryCallbackInterface $callback): self
     {
         $this->summaryCallback = $callback;
         return $this;
     }
 
-    public function setGlobals(array $globals): self
+    // ============================================
+    // WORKFLOW BUILDING
+    // ============================================
+
+    /**
+     * Add a step/job to workflow
+     */
+    public function addStep(string $stepId, $job, array $dependencies = []): self
     {
-        $this->globals = $globals;
+        $this->steps[$stepId] = $job;
+        $this->stepDependencies[$stepId] = $dependencies;
         return $this;
     }
 
-    public function addStep(string $stepId, JobInterface $job, array $inputs = []): self
+    /**
+     * Connect two steps (for visualization)
+     */
+    public function connect(string $fromStep, string $toStep): self
     {
-        $jobName = $this->extractJobName($job);
-
-        $this->steps[$stepId] = [
-            'id' => $stepId,
-            'job' => $job,
-            'name' => $jobName,
-            'inputs' => $inputs,
-            'dependencies' => []
-        ];
-
-        return $this;
-    }
-
-    public function connect(string $fromNodeId, string $toNodeId): self
-    {
-        if (!isset($this->steps[$fromNodeId])) {
-            throw new \InvalidArgumentException("Step '$fromNodeId' does not exist");
-        }
-
-        if (!isset($this->steps[$toNodeId])) {
-            throw new \InvalidArgumentException("Step '$toNodeId' does not exist");
-        }
-
         $this->connections[] = [
-            'from' => $fromNodeId,
-            'to' => $toNodeId
+            'from' => $fromStep,
+            'to' => $toStep
         ];
-
-        $this->steps[$toNodeId]['dependencies'][] = $fromNodeId;
-
         return $this;
     }
 
+    // ============================================
+    // EXECUTION
+    // ============================================
+
+    /**
+     * Execute the workflow
+     */
     public function execute(): array
     {
         $this->startTime = microtime(true);
-        $this->startMemory = memory_get_usage(true);
 
-        if ($this->tracker) {
-            $this->tracker->initWorkflow($this->id, [
-                'name' => $this->name,
-                'description' => $this->description,
-                'total_steps' => count($this->steps)
-            ]);
-        }
+        // Prepare context with workflow structure
+        $this->prepareContext();
+
+        // Mark workflow as started
+        $this->context->markStarted();
+        $this->syncToRedis();
 
         try {
-            if ($this->tracker) {
-                $this->tracker->updateStatus($this->id, 'running');
-            }
-
-            $executionOrder = $this->buildExecutionOrder();
+            // Execute steps in dependency order
+            $executionOrder = $this->resolveExecutionOrder();
+            $results = [];
 
             foreach ($executionOrder as $stepId) {
-                $this->executeStep($stepId);
+                /**
+                 * @var JobInterface $job
+                 */
+                $job = $this->steps[$stepId];
+
+                // Execute step
+                $result = $this->executeStep($stepId, $job);
+                $results[$stepId] = $result;
+
+                // Store result in context
+                $this->context->setResult($stepId, $result);
+                $this->syncToRedis();
             }
 
-            if ($this->tracker) {
-                $this->tracker->updateStatus($this->id, 'completed');
-            }
+            // Mark workflow as completed
+            $this->completeWorkflow();
 
-            $summary = $this->generateSummary();
-
-            if ($this->summaryCallback) {
-                $this->summaryCallback->handle($summary);
-            }
-
-            return $this->results;
+            return $results;
 
         } catch (\Throwable $e) {
-            if ($this->tracker) {
-                $this->tracker->updateStatus($this->id, 'failed');
-            }
+            // Mark workflow as failed
+            $this->context->markFailed();
+            $this->syncToRedis();
 
             throw $e;
         }
     }
 
-    private function executeStep(string $stepId): void
+    /**
+     * Execute a single step
+     */
+    private function executeStep(string $stepId, JobInterface $job)
     {
-        $step = $this->steps[$stepId];
-        $job = $step['job'];
-        $jobName = $step['name'];
+        $startTime = microtime(true);
+        $startMemory = memory_get_usage();
 
-        $resolvedInputs = $this->resolveInputs($step['inputs']);
+        // Prepare inputs from dependencies
+        $inputs = $this->resolveStepInputs($stepId);
 
-        // Validate inputs - skip if validation fails
-        if (!$job->validateInputs($resolvedInputs)) {
-            if ($this->tracker) {
-                $this->tracker->skipJob($this->id, $jobName, $resolvedInputs, 'validation_failed');
-            }
-            $this->results[$stepId] = ['skipped' => true, 'reason' => 'validation_failed'];
-            return;
-        }
-
-        if ($this->tracker) {
-            $this->tracker->startJob($this->id, $jobName, $resolvedInputs);
-        }
+        // Add job to executed_jobs as "running"
+        $this->context->addExecutedJob([
+            'name' => $stepId,
+            'status' => 'running',
+            'inputs' => $inputs,
+            'outputs' => null,
+            'logs' => [],
+            'started_at' => date('c'),
+            'completed_at' => null,
+            'performance' => [
+                'execution_time' => 0,
+                'memory_used' => 0,
+                'peak_memory' => memory_get_peak_usage()
+            ]
+        ]);
+        $this->syncToRedis();
 
         try {
-            $result = $job->execute($resolvedInputs, $this->globals);
-            $this->results[$stepId] = $result;
+            // Execute the job
+            $result = $this->callJob($job, $inputs, $stepId);
 
-            if ($this->tracker) {
-                $this->tracker->completeJob($this->id, $jobName, $result, $resolvedInputs, $job->getLogs());
-            }
+            $executionTime = microtime(true) - $startTime;
+            $memoryUsed = memory_get_usage() - $startMemory;
+
+            // Update job as "completed"
+            $this->context->updateExecutedJob($stepId, [
+                'status' => 'completed',
+                'outputs' => $result,
+                'completed_at' => date('c'),
+                'performance' => [
+                    'execution_time' => $executionTime,
+                    'memory_used' => $memoryUsed,
+                    'peak_memory' => memory_get_peak_usage()
+                ]
+            ]);
+            $this->syncToRedis();
+
+            return $result;
 
         } catch (\Throwable $e) {
-            if ($this->tracker) {
-                $this->tracker->failJob($this->id, $jobName, $e, $resolvedInputs, $job->getLogs());
-            }
+            // Update job as "failed"
+            $this->context->updateExecutedJob($stepId, [
+                'status' => 'failed',
+                'error' => $e->getMessage(),
+                'completed_at' => date('c')
+            ]);
+            $this->syncToRedis();
 
             throw $e;
         }
     }
 
-    private function resolveInputs(array $inputMapping): array
+    /**
+     * Call the job with inputs
+     */
+    private function callJob(JobInterface $job, array $inputs, string $stepId = '')
     {
-        $resolved = [];
+        if (is_callable($job)) {
+            return $job($inputs, $this);
+        }
 
-        foreach ($inputMapping as $inputKey => $mapping) {
-            if (is_array($mapping) && count($mapping) === 1) {
-                $stepId = array_key_first($mapping);
-                $resultKey = $mapping[$stepId];
+        if ($job instanceof JobInterface) {
+            return $job->setId($stepId)
+                ->setContext($this->context)
+                ->execute($inputs);
+        }
 
-                if (isset($this->results[$stepId])) {
-                    $stepResult = $this->results[$stepId];
+        throw new \Exception("Job must be callable or have a handle() method");
+    }
 
-                    if (is_array($stepResult) && isset($stepResult[$resultKey])) {
-                        $resolved[$inputKey] = $stepResult[$resultKey];
-                    } else {
-                        $resolved[$inputKey] = $stepResult;
-                    }
+    /**
+     * Resolve step inputs from dependencies
+     */
+    private function resolveStepInputs(string $stepId): array
+    {
+        $inputs = [];
+        $dependencies = $this->stepDependencies[$stepId] ?? [];
+
+        foreach ($dependencies as $key => $dependency) {
+            if (is_array($dependency)) {
+                // Format: 'key' => ['stepId' => 'outputKey']
+                foreach ($dependency as $sourceStep => $outputKey) {
+                    $result = $this->context->getResult($sourceStep);
+                    $inputs[$key] = $result[$outputKey] ?? null;
                 }
             } else {
-                $resolved[$inputKey] = $mapping;
+                // Simple format: 'stepId'
+                $inputs[$key] = $this->context->getResult($dependency);
             }
         }
 
-        return $resolved;
+        return $inputs;
     }
 
-    private function buildExecutionOrder(): array
+    /**
+     * Resolve execution order based on dependencies
+     */
+    private function resolveExecutionOrder(): array
     {
+        // Simple topological sort
         $order = [];
         $visited = [];
-        $temp = [];
 
-        $visit = function($stepId) use (&$visit, &$order, &$visited, &$temp) {
-            if (isset($temp[$stepId])) {
-                throw new \RuntimeException("Circular dependency detected at step: $stepId");
-            }
-
+        $visit = function ($stepId) use (&$visit, &$order, &$visited) {
             if (isset($visited[$stepId])) {
                 return;
             }
 
-            $temp[$stepId] = true;
+            $visited[$stepId] = true;
 
-            foreach ($this->steps[$stepId]['dependencies'] as $depId) {
-                $visit($depId);
+            // Visit dependencies first
+            $deps = $this->stepDependencies[$stepId] ?? [];
+            foreach ($deps as $dep) {
+                if (is_array($dep)) {
+                    foreach ($dep as $sourceStep => $outputKey) {
+                        $visit($sourceStep);
+                    }
+                } else {
+                    $visit($dep);
+                }
             }
 
-            unset($temp[$stepId]);
-            $visited[$stepId] = true;
             $order[] = $stepId;
         };
 
         foreach (array_keys($this->steps) as $stepId) {
-            if (!isset($visited[$stepId])) {
-                $visit($stepId);
-            }
+            $visit($stepId);
         }
 
         return $order;
     }
 
-    private function extractJobName(JobInterface $job): string
+    /**
+     * Prepare context with workflow structure
+     */
+    private function prepareContext(): void
     {
-        if (method_exists($job, 'getName')) {
-            return $job->getName();
+        $steps = [];
+        foreach ($this->steps as $stepId => $job) {
+            $steps[$stepId] = [
+                'id' => $stepId,
+                'name' => $stepId,
+                'dependencies' => $this->getDependencyStepIds($stepId)
+            ];
         }
 
-        $reflection = new ReflectionClass($job);
-        $attributes = $reflection->getAttributes(Job::class);
-
-        if (!empty($attributes)) {
-            $jobAttribute = $attributes[0]->newInstance();
-            return $jobAttribute->name;
-        }
-
-        return basename(str_replace('\\', '/', get_class($job)));
+        $this->context->setSteps($steps);
+        $this->context->setConnections($this->connections);
     }
 
-    public function generateSummary(): array
+    /**
+     * Get dependency step IDs
+     */
+    private function getDependencyStepIds(string $stepId): array
     {
-        $trackerData = $this->tracker ? $this->tracker->getWorkflowData($this->id) : [];
+        $deps = [];
+        $dependencies = $this->stepDependencies[$stepId] ?? [];
 
-        $endTime = microtime(true);
-        $endMemory = memory_get_usage(true);
+        foreach ($dependencies as $dependency) {
+            if (is_array($dependency)) {
+                foreach ($dependency as $sourceStep => $outputKey) {
+                    $deps[] = $sourceStep;
+                }
+            } else {
+                $deps[] = $dependency;
+            }
+        }
 
-        return [
-            'workflow_id' => $this->id,
-            'name' => $this->name,
-            'description' => $this->description,
-            'status' => $trackerData['status'] ?? 'completed',
-            'started_at' => $trackerData['started_at'] ?? null,
-            'completed_at' => $trackerData['completed_at'] ?? null,
-            'performance' => [
-                'total_execution_time' => round($endTime - $this->startTime, 4),
-                'total_memory_used' => $endMemory - $this->startMemory,
-                'peak_memory' => memory_get_peak_usage(true),
-                'start_memory' => $this->startMemory
-            ],
-            'steps' => array_map(function($step) {
-                return [
-                    'id' => $step['id'],
-                    'name' => $step['name'],
-                    'dependencies' => $step['dependencies']
-                ];
-            }, $this->steps),
-            'connections' => $this->connections,
-            'executed_jobs' => $trackerData['executed_jobs'] ?? [],
-            'results' => $this->results
-        ];
+        return array_unique($deps);
+    }
+
+    /**
+     * Complete workflow execution
+     */
+    private function completeWorkflow(): void
+    {
+        $executionTime = microtime(true) - $this->startTime;
+
+        $this->context->setExecutionTime($executionTime);
+        $this->context->markCompleted();
+        $this->syncToRedis();
+
+        // Set Redis expiry
+        if ($this->tracker) {
+            $this->tracker->setExpiry($this->context->getWorkflowId(), 3600);
+        }
+
+        // Call summary callback if set
+        if ($this->summaryCallback) {
+            $this->summaryCallback->handle($this->getSummary());
+        }
+    }
+
+    // ============================================
+    // LOGGING
+    // ============================================
+
+    /**
+     * Add log to current executing step
+     */
+    public function log(string $stepId, string $message): void
+    {
+        $this->context->addJobLog($stepId, $message);
+        $this->syncToRedis();
+    }
+
+    // ============================================
+    // GETTERS
+    // ============================================
+
+    public function getContext(): WorkflowContext
+    {
+        return $this->context;
+    }
+
+    public function getWorkflowId(): string
+    {
+        return $this->context->getWorkflowId();
     }
 
     public function getSummary(): array
     {
-        return $this->generateSummary();
+        return $this->context->toArray();
     }
 
-    public function getId(): string
-    {
-        return $this->id;
-    }
+    // ============================================
+    // REDIS SYNC
+    // ============================================
 
-    public static function fromJson(string $json, array $jobRegistry = []): self
+    /**
+     * Sync current context to Redis (if tracker is set)
+     */
+    private function syncToRedis(): void
     {
-        $config = json_decode($json, true);
-
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new \InvalidArgumentException('Invalid JSON: ' . json_last_error_msg());
+        if ($this->tracker && $this->tracker->isEnabled()) {
+            $this->tracker->sync($this->context);
         }
-
-        $workflow = new self(
-            $config['name'] ?? null,
-            $config['description'] ?? null
-        );
-
-        foreach ($config['nodes'] ?? [] as $node) {
-            $jobClass = $node['job_class'] ?? null;
-
-            if (!$jobClass || !isset($jobRegistry[$jobClass])) {
-                throw new \InvalidArgumentException("Job class not found in registry: $jobClass");
-            }
-
-            $job = $jobRegistry[$jobClass];
-            $workflow->addStep($node['id'], $job, $node['inputs'] ?? []);
-        }
-
-        foreach ($config['connections'] ?? [] as $connection) {
-            $workflow->connect($connection['from'], $connection['to']);
-        }
-
-        return $workflow;
     }
 
-    public function toJson(): string
-    {
-        $config = [
-            'id' => $this->id,
-            'name' => $this->name,
-            'description' => $this->description,
-            'nodes' => array_map(function($step) {
-                return [
-                    'id' => $step['id'],
-                    'job_class' => get_class($step['job']),
-                    'name' => $step['name'],
-                    'inputs' => $step['inputs']
-                ];
-            }, array_values($this->steps)),
-            'connections' => $this->connections
-        ];
+    // ============================================
+    // UTILITIES
+    // ============================================
 
-        return json_encode($config, JSON_PRETTY_PRINT);
-    }
-
-    private function generateUuid(): string
+    private function generateWorkflowId(): string
     {
-        return sprintf('%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
+        return sprintf(
+            '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
             mt_rand(0, 0xffff), mt_rand(0, 0xffff),
             mt_rand(0, 0xffff),
             mt_rand(0, 0x0fff) | 0x4000,

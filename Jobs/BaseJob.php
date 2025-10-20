@@ -1,13 +1,17 @@
 <?php
+
 namespace App\WorkflowRodoud\Jobs;
 
 use App\WorkflowRodoud\Contracts\JobInterface;
 use App\WorkflowRodoud\Attributes\Job;
+use App\WorkflowRodoud\WorkflowContext;
+use DateTime;
 use ReflectionClass;
 
 abstract class BaseJob implements JobInterface
 {
-    private array $logs = [];
+    public string $id;
+    public WorkflowContext $context;
 
     public function getName(): string
     {
@@ -27,20 +31,24 @@ abstract class BaseJob implements JobInterface
         return true;
     }
 
-    public function addLog(string $level, string $message, array $context = []): void
+    public function setId(string $id): JobInterface
     {
-        $this->logs[] = [
-            'level' => $level,
-            'message' => $message,
-            'context' => $context,
-            'timestamp' => (new DateTime())->format('c')
-        ];
+        $this->id = $id;
+        return $this;
     }
 
-    public function getLogs(): array
+    public function setContext(WorkflowContext $context): self
     {
-        return $this->logs;
+        $this->context = $context;
+        return $this;
     }
 
-    abstract public function execute(array $inputs = [], array $globals = []): mixed;
+    abstract public function execute(array $inputs = []): mixed;
+
+    public function addLog(string $log): void
+    {
+        $this->context->addJobLog($this->id, $log);
+    }
+
+
 }

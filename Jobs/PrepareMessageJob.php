@@ -3,12 +3,16 @@
 namespace App\WorkflowRodoud\Jobs;
 
 use App\WorkflowRodoud\Attributes\Job;
+use App\WorkflowRodoud\WorkflowContext;
 
 #[Job(name: 'prepare_message', description: 'Prepare message for AI')]
 class PrepareMessageJob extends BaseJob
 {
-    public function execute(array $inputs = [], array $globals = []): mixed
+    public function execute(array $inputs = []): mixed
     {
+
+        $this->addLog('Preparing message');;
+
         $instruction = $inputs['instruction'] ?? '';
 
         // Your logic here

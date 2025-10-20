@@ -7,56 +7,138 @@ namespace App\WorkflowRodoud;
  */
 class WorkflowContext
 {
-    private array $globalVars = [];
-    private array $stepVars = [];
+    private string $workflowId;
+    private string $name;
+    private string $status = 'pending';
+    private array $steps = [];
+    private array $connections = [];
     private array $results = [];
+    private array $executedJobs = [];
+    private array $globals = [];
+    private ?string $startedAt = null;
+    private ?string $completedAt = null;
+    private array $performance = [];
+    private ?string $description = null;
 
-    public function setGlobal(string $key, mixed $value): void
+    public function __construct(string $workflowId, string $name)
     {
-        $this->globalVars[$key] = $value;
+        $this->workflowId = $workflowId;
+        $this->name = $name;
+        $this->performance = [
+            'start_memory' => memory_get_usage(),
+            'peak_memory' => memory_get_peak_usage(),
+            'total_memory_used' => 0,
+            'total_execution_time' => 0
+        ];
     }
 
-    public function getGlobal(string $key, mixed $default = null): mixed
+    // ============================================
+    // SETTERS - Update context state
+    // ============================================
+
+    public function setStatus(string $status): self
     {
-        return $this->globalVars[$key] ?? $default;
+        $this->status = $status;
+        return $this;
     }
 
-    public function setStepVar(string $stepId, string $key, mixed $value): void
+    public function setSteps(array $steps): self
     {
-        $this->stepVars[$stepId][$key] = $value;
+        $this->steps = $steps;
+        return $this;
     }
 
-    public function getStepVar(string $stepId, string $key, mixed $default = null): mixed
+    public function setConnections(array $connections): self
     {
-        return $this->stepVars[$stepId][$key] ?? $default;
+        $this->connections = $connections;
+        return $this;
     }
 
-    public function getStepVars(string $stepId): array
+    public function setGlobals(array $globals): self
     {
-        return $this->stepVars[$stepId] ?? [];
+        $this->globals = $globals;
+        return $this;
     }
 
-    public function setResult(string $stepId, JobResult $result): void
+    public function setDescription(?string $description): self
     {
-        $this->results[$stepId] = $result;
+        $this->description = $description;
+        return $this;
     }
 
-    public function getResult(string $stepId): ?JobResult
+    public function markStarted(): self
     {
-        return $this->results[$stepId] ?? null;
+        $this->startedAt = date('c');
+        $this->status = 'running';
+        return $this;
     }
 
-    public function getResultOutput(string $stepId, ?string $key = null, mixed $default = null): mixed
+    public function markCompleted(): self
     {
-        if (!isset($this->results[$stepId])) {
-            return $default;
-        }
+        $this->completedAt = date('c');
+        $this->status = 'completed';
+        $this->performance['peak_memory'] = memory_get_peak_usage();
+        $this->performance['total_memory_used'] =
+            $this->performance['peak_memory'] - $this->performance['start_memory'];
+        return $this;
+    }
 
-        if ($key === null) {
-            return $this->results[$stepId]->output;
-        }
+    public function markFailed(): self
+    {
+        $this->completedAt = date('c');
+        $this->status = 'failed';
+        return $this;
+    }
 
-        return $this->results[$stepId]->output[$key] ?? $default;
+    public function setExecutionTime(float $time): self
+    {
+        $this->performance['total_execution_time'] = $time;
+        return $this;
+    }
+
+    // ============================================
+    // JOB TRACKING
+    // ============================================
+
+    public function addExecutedJob(array $jobData): self
+    {
+        $this->executedJobs[$jobData["name"]] = $jobData;
+        return $this;
+    }
+
+    public function updateExecutedJob(string $jobName, array $updates): self
+    {
+        $this->executedJobs[$jobName] = array_merge($this->executedJobs[$jobName], $updates);
+
+        return $this;
+    }
+
+    public function findExecutedJob(string $jobName): ?array
+    {
+            return  $this->executedJobs[$jobName] ?? null;
+    }
+
+    public function addJobLog(string $jobName, string $message): self
+    {
+
+        $this->executedJobs[$jobName]['logs'][] = '[' . date('c') . '] ' . $message;
+
+        return $this;
+    }
+
+    // ============================================
+    // RESULTS
+    // ============================================
+
+    public function setResult(string $stepName, $result): self
+    {
+        $this->results[$stepName] = $result;
+        return $this;
+    }
+
+    public function getResult(string $stepName)
+    {
+        return $this->results[$stepName] ?? null;
     }
 
     public function getAllResults(): array
@@ -64,35 +146,78 @@ class WorkflowContext
         return $this->results;
     }
 
-    public function getAllGlobals(): array
+    // ============================================
+    // GETTERS
+    // ============================================
+
+    public function getWorkflowId(): string
     {
-        return $this->globalVars;
+        return $this->workflowId;
     }
 
-    /**
-     * Resolve input references like ["jobId" => "outputKey"]
-     */
-    public function resolveInputs(array $inputs): array
+    public function getName(): string
     {
-        $resolved = [];
+        return $this->name;
+    }
 
-        foreach ($inputs as $key => $value) {
-            if (is_array($value) && count($value) === 1) {
-                // Check if it's a job reference
-                $refKey = array_key_first($value);
-                $refValue = $value[$refKey];
+    public function getStatus(): string
+    {
+        return $this->status;
+    }
 
-                if (isset($this->results[$refKey])) {
-                    // It's a job result reference
-                    $resolved[$key] = $this->getResultOutput($refKey, $refValue);
-                } else {
-                    $resolved[$key] = $value;
-                }
-            } else {
-                $resolved[$key] = $value;
-            }
-        }
+    public function getSteps(): array
+    {
+        return $this->steps;
+    }
 
-        return $resolved;
+    public function getConnections(): array
+    {
+        return $this->connections;
+    }
+
+    public function getGlobals(): array
+    {
+        return $this->globals;
+    }
+
+    public function getGlobal(string $key, $default = null)
+    {
+        return $this->globals[$key] ?? $default;
+    }
+
+    public function getExecutedJobs(): array
+    {
+        return $this->executedJobs;
+    }
+
+    public function getPerformance(): array
+    {
+        return $this->performance;
+    }
+
+    // ============================================
+    // EXPORT - Convert to array for Redis/DB
+    // ============================================
+
+    public function toArray(): array
+    {
+        return [
+            'workflow_id' => $this->workflowId,
+            'name' => $this->name,
+            'status' => $this->status,
+            'description' => $this->description,
+            'steps' => $this->steps,
+            'connections' => $this->connections,
+            'results' => $this->results,
+            'executed_jobs' => $this->executedJobs,
+            'started_at' => $this->startedAt,
+            'completed_at' => $this->completedAt,
+            'performance' => $this->performance
+        ];
+    }
+
+    public function toJson(): string
+    {
+        return json_encode($this->toArray());
     }
 }

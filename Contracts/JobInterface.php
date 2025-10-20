@@ -2,16 +2,17 @@
 
 namespace App\WorkflowRodoud\Contracts;
 
+use App\WorkflowRodoud\WorkflowContext;
+
 interface JobInterface
 {
     /**
      * Execute the job with given inputs
      *
      * @param array $inputs Input data for the job
-     * @param array $globals Global context available to all jobs
      * @return mixed Job execution result
      */
-    public function execute(array $inputs = [], array $globals = []): mixed;
+    public function execute(array $inputs = []): mixed;
 
     /**
      * Get the job name (can be overridden or use attribute)
@@ -28,6 +29,10 @@ interface JobInterface
      */
     public function validateInputs(array $inputs = []): bool;
 
-    public function getLogs(): array;
-    public function addLog(string $level, string $message, array $context = []): void;
+    public function setId(string $id): self;
+
+    public function addLog(string $log): void;
+
+    public function setContext(WorkflowContext $context): self;
+
 }

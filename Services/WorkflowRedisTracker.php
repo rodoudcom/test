@@ -2,229 +2,126 @@
 
 namespace App\WorkflowRodoud\Services;
 
+use App\WorkflowRodoud\WorkflowContext;
 use Redis;
 use DateTime;
 
+/**
+ * WorkflowRedisTracker - Optional Redis mirror for real-time debugging
+ *
+ * This is NOT the source of truth
+ * It just mirrors WorkflowContext to Redis for real-time monitoring
+ * If Redis fails, workflow continues normally
+ */
 class WorkflowRedisTracker
 {
     private Redis $redis;
-    private const WORKFLOW_PREFIX = 'workflow:';
-    private const TTL = 86400;
+    private bool $enabled = true;
 
     public function __construct(Redis $redis)
     {
         $this->redis = $redis;
     }
 
-    public function initWorkflow(string $workflowId, array $metadata = []): void
+    /**
+     * Enable/disable tracking (useful for testing or production)
+     */
+    public function enable(): self
     {
-        $key = $this->getWorkflowKey($workflowId);
-
-        $data = [
-            'id' => $workflowId,
-            'status' => 'initialized',
-            'started_at' => (new DateTime())->format('c'),
-            'metadata' => $metadata,
-            'executed_jobs' => [],
-            'current_job' => null,
-            'performance' => [
-                'start_memory' => memory_get_usage(true),
-                'peak_memory' => 0,
-                'execution_time' => 0
-            ]
-        ];
-
-        $this->redis->setex($key, self::TTL, json_encode($data));
-        $this->publish($workflowId, 'workflow_initialized', $data);
+        $this->enabled = true;
+        return $this;
     }
 
-    public function updateStatus(string $workflowId, string $status): void
+    public function disable(): self
     {
-        $data = $this->getWorkflowData($workflowId);
-        $data['status'] = $status;
+        $this->enabled = false;
+        return $this;
+    }
 
-        if ($status === 'completed' || $status === 'failed') {
-            $data['completed_at'] = (new DateTime())->format('c');
+    public function isEnabled(): bool
+    {
+        return $this->enabled;
+    }
 
-            // Calculate total execution time
-            $start = new DateTime($data['started_at']);
-            $end = new DateTime($data['completed_at']);
-            $data['performance']['execution_time'] = $end->getTimestamp() - $start->getTimestamp();
+    /**
+     * Get Redis key for workflow
+     */
+    private function getRedisKey(string $workflowId): string
+    {
+        return "workflow:realtime:{$workflowId}";
+    }
 
-            // Update peak memory
-            $data['performance']['peak_memory'] = memory_get_peak_usage(true);
-            $data['performance']['memory_used'] = memory_get_usage(true) - $data['performance']['start_memory'];
+    /**
+     * Sync WorkflowContext to Redis
+     * This is the ONLY method that writes to Redis
+     */
+    public function sync(WorkflowContext $context): void
+    {
+        if (!$this->enabled) {
+            return;
         }
 
-        $this->saveWorkflowData($workflowId, $data);
-        $this->publish($workflowId, 'status_updated', ['status' => $status]);
+        try {
+            $workflowId = $context->getWorkflowId();
+            $data = $context->toArray();
+
+            // Write to Redis
+            $this->redis->set($this->getRedisKey($workflowId), json_encode($data));
+
+            // Publish to pub/sub for WebSocket broadcasting (optional)
+            $this->redis->publish("workflow:updates:{$workflowId}", json_encode($data));
+
+        } catch (\Exception $e) {
+            // Redis failed - log but don't break workflow execution
+            error_log("WorkflowRedisTracker: Failed to sync to Redis: " . $e->getMessage());
+        }
     }
 
-    public function startJob(string $workflowId, string $jobName, array $inputs = []): void
+    /**
+     * Set expiry on Redis key when workflow completes
+     */
+    public function setExpiry(string $workflowId, int $seconds = 3600): void
     {
-        $data = $this->getWorkflowData($workflowId);
-        $data['current_job'] = [
-            'name' => $jobName,
-            'status' => 'running',
-            'started_at' => (new DateTime())->format('c'),
-            'inputs' => $inputs,
-            'performance' => [
-                'start_time' => microtime(true),
-                'start_memory' => memory_get_usage(true)
-            ]
-        ];
-
-        $this->saveWorkflowData($workflowId, $data);
-        $this->publish($workflowId, 'job_started', [
-            'job' => $jobName,
-            'inputs' => $inputs
-        ]);
-    }
-
-    public function completeJob(string $workflowId, string $jobName, mixed $result, array $inputs, array $logs): void
-    {
-        $data = $this->getWorkflowData($workflowId);
-        $currentJob = $data['current_job'];
-
-        $endTime = microtime(true);
-        $endMemory = memory_get_usage(true);
-
-        $executedJob = [
-            'name' => $jobName,
-            'status' => 'completed',
-            'started_at' => $currentJob['started_at'],
-            'completed_at' => (new DateTime())->format('c'),
-            'inputs' => $inputs,
-            'outputs' => $this->serializeResult($result),
-            'logs' => $logs,
-            'performance' => [
-                'execution_time' => round($endTime - $currentJob['performance']['start_time'], 4),
-                'memory_used' => $endMemory - $currentJob['performance']['start_memory'],
-                'peak_memory' => memory_get_peak_usage(true)
-            ]
-        ];
-
-        $data['executed_jobs'][] = $executedJob;
-        $data['current_job'] = null;
-
-        $this->saveWorkflowData($workflowId, $data);
-        $this->publish($workflowId, 'job_completed', [
-            'job' => $jobName,
-            'outputs' => $this->serializeResult($result),
-            'performance' => $executedJob['performance']
-        ]);
-    }
-
-    public function failJob(string $workflowId, string $jobName, \Throwable $exception, array $inputs, array $logs): void
-    {
-        $data = $this->getWorkflowData($workflowId);
-        $currentJob = $data['current_job'];
-
-        $endTime = microtime(true);
-        $endMemory = memory_get_usage(true);
-
-        $failedJob = [
-            'name' => $jobName,
-            'status' => 'failed',
-            'started_at' => $currentJob['started_at'] ?? (new DateTime())->format('c'),
-            'failed_at' => (new DateTime())->format('c'),
-            'inputs' => $inputs,
-            'logs' => $logs,
-            'error' => [
-                'message' => $exception->getMessage(),
-                'code' => $exception->getCode(),
-                'file' => $exception->getFile(),
-                'line' => $exception->getLine()
-            ],
-            'performance' => [
-                'execution_time' => isset($currentJob['performance']['start_time'])
-                    ? round($endTime - $currentJob['performance']['start_time'], 4)
-                    : 0,
-                'memory_used' => isset($currentJob['performance']['start_memory'])
-                    ? $endMemory - $currentJob['performance']['start_memory']
-                    : 0,
-                'peak_memory' => memory_get_peak_usage(true)
-            ]
-        ];
-
-        $data['executed_jobs'][] = $failedJob;
-        $data['current_job'] = null;
-        $data['status'] = 'failed';
-
-        $this->saveWorkflowData($workflowId, $data);
-        $this->publish($workflowId, 'job_failed', [
-            'job' => $jobName,
-            'error' => $failedJob['error']
-        ]);
-    }
-
-    public function skipJob(string $workflowId, string $jobName, array $inputs, string $reason): void
-    {
-        $data = $this->getWorkflowData($workflowId);
-
-        $skippedJob = [
-            'name' => $jobName,
-            'status' => 'skipped',
-            'skipped_at' => (new DateTime())->format('c'),
-            'inputs' => $inputs,
-            'outputs' => null,
-            'logs' => [],
-            'reason' => $reason,
-            'performance' => [
-                'execution_time' => 0,
-                'memory_used' => 0,
-                'peak_memory' => 0
-            ]
-        ];
-
-        $data['executed_jobs'][] = $skippedJob;
-
-        $this->saveWorkflowData($workflowId, $data);
-        $this->publish($workflowId, 'job_skipped', [
-            'job' => $jobName,
-            'reason' => $reason
-        ]);
-    }
-
-    public function getWorkflowData(string $workflowId): array
-    {
-        $key = $this->getWorkflowKey($workflowId);
-        $data = $this->redis->get($key);
-
-        return $data ? json_decode($data, true) : [];
-    }
-
-    private function saveWorkflowData(string $workflowId, array $data): void
-    {
-        $key = $this->getWorkflowKey($workflowId);
-        $this->redis->setex($key, self::TTL, json_encode($data));
-    }
-
-    private function publish(string $workflowId, string $eventType, array $data): void
-    {
-        $this->redis->publish("workflow:$workflowId", json_encode([
-            'type' => $eventType,
-            'data' => $data,
-            'timestamp' => (new DateTime())->format('c')
-        ]));
-    }
-
-    private function getWorkflowKey(string $workflowId): string
-    {
-        return self::WORKFLOW_PREFIX . $workflowId;
-    }
-
-    private function serializeResult(mixed $result): mixed
-    {
-        if (is_object($result)) {
-            return [
-                '_type' => 'object',
-                'class' => get_class($result),
-                'data' => method_exists($result, 'toArray') ? $result->toArray() : (array) $result
-            ];
+        if (!$this->enabled) {
+            return;
         }
 
-        return $result;
+        try {
+            $this->redis->expire($this->getRedisKey($workflowId), $seconds);
+        } catch (\Exception $e) {
+            error_log("WorkflowRedisTracker: Failed to set expiry: " . $e->getMessage());
+        }
+    }
+
+    /**
+     * Get workflow state from Redis (for API endpoints)
+     */
+    public static function get(Redis $redis, string $workflowId): ?array
+    {
+        try {
+            $key = "workflow:realtime:{$workflowId}";
+            $data = $redis->get($key);
+            return $data ? json_decode($data, true) : null;
+        } catch (\Exception $e) {
+            error_log("WorkflowRedisTracker: Failed to get from Redis: " . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Clear workflow from Redis
+     */
+    public function clear(string $workflowId): void
+    {
+        if (!$this->enabled) {
+            return;
+        }
+
+        try {
+            $this->redis->del($this->getRedisKey($workflowId));
+        } catch (\Exception $e) {
+            error_log("WorkflowRedisTracker: Failed to clear from Redis: " . $e->getMessage());
+        }
     }
 }
 
