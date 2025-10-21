@@ -14,7 +14,8 @@ class PrepareMessageJob extends BaseJob
         $this->addLog('Preparing message');;
 
         $instruction = $inputs['instruction'] ?? '';
-
+        sleep(5);
+        $this->addLog('>>>>>>>>>after sleep');
         // Your logic here
         return [
             'messages' => [

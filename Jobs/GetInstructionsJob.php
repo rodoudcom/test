@@ -11,9 +11,11 @@ class GetInstructionsJob extends BaseJob
     public function execute(array $inputs = []): mixed
     {
 
-        $this->addLog('Getting instructions');
+        $this->addLog('>>>>>>>>>Getting instructions');
         $conversationContext = $globals['conversationContext'] ?? [];
 
+        sleep(15);
+        $this->addLog('>>>>>>>>>after sleep');
         // Your logic here
         return [
             'instruction' => 'Process the conversation with AI...',

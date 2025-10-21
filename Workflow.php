@@ -416,4 +416,17 @@ class Workflow
             mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
         );
     }
+
+
+    /**
+     * Configure retry for the last added step
+     */
+    public function withRetry(int $maxAttempts, float $baseDelay = 1.0, float $multiplier = 2.0): self
+    {
+        $lastStep = end($this->steps);
+        if ($lastStep) {
+            $lastStep->retry = new RetryConfig($maxAttempts, $baseDelay, $multiplier);
+        }
+        return $this;
+    }
 }
