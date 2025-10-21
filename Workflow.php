@@ -5,9 +5,7 @@ namespace App\WorkflowRodoud;
 
 use App\WorkflowRodoud\Contracts\JobInterface;
 use App\WorkflowRodoud\Contracts\WorkflowSummaryCallbackInterface;
-use App\WorkflowRodoud\Attributes\Job;
 use App\WorkflowRodoud\Services\WorkflowRedisTracker;
-use ReflectionClass;
 
 /**
  * Workflow - Main workflow execution engine
@@ -18,12 +16,7 @@ use ReflectionClass;
 class Workflow
 {
     private WorkflowContext $context;
-    private ?WorkflowRedisTracker $tracker = null;
-    private array $steps = [];
-    private array $stepDependencies = [];
-    private array $connections = [];
     private ?WorkflowSummaryCallbackInterface $summaryCallback = null;
-    private float $startTime;
 
     public function __construct(string $name)
     {
@@ -40,7 +33,7 @@ class Workflow
      */
     public function setTracker(WorkflowRedisTracker $tracker): self
     {
-        $this->tracker = $tracker;
+        $this->context->tracker = $tracker;
         return $this;
     }
 
@@ -50,7 +43,7 @@ class Workflow
     public function setGlobals(array $globals): self
     {
         $this->context->setGlobals($globals);
-        $this->syncToRedis();
+
         return $this;
     }
 
@@ -60,7 +53,7 @@ class Workflow
     public function setDescription(string $description): self
     {
         $this->context->setDescription($description);
-        $this->syncToRedis();
+
         return $this;
     }
 
@@ -80,19 +73,19 @@ class Workflow
     /**
      * Add a step/job to workflow
      */
-    public function addStep(string $stepId, $job, array $dependencies = []): self
+    public function addStep(string $stepId, JobInterface $job, array $inputs = []): self
     {
-        $this->steps[$stepId] = $job;
-        $this->stepDependencies[$stepId] = $dependencies;
+        $this->context->steps[$stepId] = $job;
+        $this->context->stepInputs[$stepId] = $inputs;
         return $this;
     }
 
     /**
-     * Connect two steps (for visualization)
+     * Connect two steps (for visualization) and for stops order
      */
     public function connect(string $fromStep, string $toStep): self
     {
-        $this->connections[] = [
+        $this->context->connections[] = [
             'from' => $fromStep,
             'to' => $toStep
         ];
@@ -108,25 +101,21 @@ class Workflow
      */
     public function execute(): array
     {
-        $this->startTime = microtime(true);
 
-        // Prepare context with workflow structure
-        $this->prepareContext();
 
         // Mark workflow as started
         $this->context->markStarted();
-        $this->syncToRedis();
+
 
         try {
             // Execute steps in dependency order
+            //TODO excute in connect order
             $executionOrder = $this->resolveExecutionOrder();
             $results = [];
 
             foreach ($executionOrder as $stepId) {
-                /**
-                 * @var JobInterface $job
-                 */
-                $job = $this->steps[$stepId];
+
+                $job = $this->context->steps[$stepId];
 
                 // Execute step
                 $result = $this->executeStep($stepId, $job);
@@ -134,7 +123,6 @@ class Workflow
 
                 // Store result in context
                 $this->context->setResult($stepId, $result);
-                $this->syncToRedis();
             }
 
             // Mark workflow as completed
@@ -145,8 +133,6 @@ class Workflow
         } catch (\Throwable $e) {
             // Mark workflow as failed
             $this->context->markFailed();
-            $this->syncToRedis();
-
             throw $e;
         }
     }
@@ -169,7 +155,8 @@ class Workflow
             'inputs' => $inputs,
             'outputs' => null,
             'logs' => [],
-            'started_at' => date('c'),
+            'error' => [],
+            'started_at' => microtime(true),
             'completed_at' => null,
             'performance' => [
                 'execution_time' => 0,
@@ -177,7 +164,7 @@ class Workflow
                 'peak_memory' => memory_get_peak_usage()
             ]
         ]);
-        $this->syncToRedis();
+
 
         try {
             // Execute the job
@@ -190,14 +177,14 @@ class Workflow
             $this->context->updateExecutedJob($stepId, [
                 'status' => 'completed',
                 'outputs' => $result,
-                'completed_at' => date('c'),
+                'completed_at' => microtime(true),
                 'performance' => [
                     'execution_time' => $executionTime,
                     'memory_used' => $memoryUsed,
                     'peak_memory' => memory_get_peak_usage()
                 ]
             ]);
-            $this->syncToRedis();
+
 
             return $result;
 
@@ -206,9 +193,9 @@ class Workflow
             $this->context->updateExecutedJob($stepId, [
                 'status' => 'failed',
                 'error' => $e->getMessage(),
-                'completed_at' => date('c')
+                'completed_at' => microtime(true)
             ]);
-            $this->syncToRedis();
+
 
             throw $e;
         }
@@ -217,19 +204,16 @@ class Workflow
     /**
      * Call the job with inputs
      */
-    private function callJob(JobInterface $job, array $inputs, string $stepId = '')
+    private function callJob(JobInterface $job, array $inputs, string $stepId = ''): mixed
     {
-        if (is_callable($job)) {
-            return $job($inputs, $this);
-        }
-
-        if ($job instanceof JobInterface) {
-            return $job->setId($stepId)
-                ->setContext($this->context)
-                ->execute($inputs);
-        }
-
-        throw new \Exception("Job must be callable or have a handle() method");
+        $lastException = null;
+        $attempt = 0;
+        //  while ($attempt < $job->retryConfig->maxAttempts) {
+        $result = $job->setId($stepId)
+            ->setContext($this->context)
+            ->execute($inputs);
+        //}
+        return $result;
     }
 
     /**
@@ -238,7 +222,7 @@ class Workflow
     private function resolveStepInputs(string $stepId): array
     {
         $inputs = [];
-        $dependencies = $this->stepDependencies[$stepId] ?? [];
+        $dependencies = $this->context->stepInputs[$stepId] ?? [];
 
         foreach ($dependencies as $key => $dependency) {
             if (is_array($dependency)) {
@@ -259,6 +243,7 @@ class Workflow
     /**
      * Resolve execution order based on dependencies
      */
+    //TODO order should be depend on connector
     private function resolveExecutionOrder(): array
     {
         // Simple topological sort
@@ -273,7 +258,7 @@ class Workflow
             $visited[$stepId] = true;
 
             // Visit dependencies first
-            $deps = $this->stepDependencies[$stepId] ?? [];
+            $deps = $this->context->stepInputs[$stepId] ?? [];
             foreach ($deps as $dep) {
                 if (is_array($dep)) {
                     foreach ($dep as $sourceStep => $outputKey) {
@@ -287,66 +272,27 @@ class Workflow
             $order[] = $stepId;
         };
 
-        foreach (array_keys($this->steps) as $stepId) {
+        foreach (array_keys($this->context->steps) as $stepId) {
             $visit($stepId);
         }
 
         return $order;
     }
 
-    /**
-     * Prepare context with workflow structure
-     */
-    private function prepareContext(): void
-    {
-        $steps = [];
-        foreach ($this->steps as $stepId => $job) {
-            $steps[$stepId] = [
-                'id' => $stepId,
-                'name' => $stepId,
-                'dependencies' => $this->getDependencyStepIds($stepId)
-            ];
-        }
-
-        $this->context->setSteps($steps);
-        $this->context->setConnections($this->connections);
-    }
-
-    /**
-     * Get dependency step IDs
-     */
-    private function getDependencyStepIds(string $stepId): array
-    {
-        $deps = [];
-        $dependencies = $this->stepDependencies[$stepId] ?? [];
-
-        foreach ($dependencies as $dependency) {
-            if (is_array($dependency)) {
-                foreach ($dependency as $sourceStep => $outputKey) {
-                    $deps[] = $sourceStep;
-                }
-            } else {
-                $deps[] = $dependency;
-            }
-        }
-
-        return array_unique($deps);
-    }
 
     /**
      * Complete workflow execution
      */
     private function completeWorkflow(): void
     {
-        $executionTime = microtime(true) - $this->startTime;
+        $executionTime = microtime(true) - $this->context->startedAt;
 
         $this->context->setExecutionTime($executionTime);
         $this->context->markCompleted();
-        $this->syncToRedis();
 
         // Set Redis expiry
-        if ($this->tracker) {
-            $this->tracker->setExpiry($this->context->getWorkflowId(), 3600);
+        if ($this->context->tracker) {
+            $this->context->tracker->setExpiry($this->context->getWorkflowId(), 3600);
         }
 
         // Call summary callback if set
@@ -355,18 +301,7 @@ class Workflow
         }
     }
 
-    // ============================================
-    // LOGGING
-    // ============================================
 
-    /**
-     * Add log to current executing step
-     */
-    public function log(string $stepId, string $message): void
-    {
-        $this->context->addJobLog($stepId, $message);
-        $this->syncToRedis();
-    }
 
     // ============================================
     // GETTERS
@@ -387,19 +322,6 @@ class Workflow
         return $this->context->toArray();
     }
 
-    // ============================================
-    // REDIS SYNC
-    // ============================================
-
-    /**
-     * Sync current context to Redis (if tracker is set)
-     */
-    private function syncToRedis(): void
-    {
-        if ($this->tracker && $this->tracker->isEnabled()) {
-            $this->tracker->sync($this->context);
-        }
-    }
 
     // ============================================
     // UTILITIES
@@ -423,10 +345,14 @@ class Workflow
      */
     public function withRetry(int $maxAttempts, float $baseDelay = 1.0, float $multiplier = 2.0): self
     {
-        $lastStep = end($this->steps);
+        /**
+         * @var JobInterface $lastStep
+         */
+        $lastStep = end($this->context->steps);
         if ($lastStep) {
-            $lastStep->retry = new RetryConfig($maxAttempts, $baseDelay, $multiplier);
+            $lastStep->setRetryConfig(new RetryConfig($maxAttempts, $baseDelay, $multiplier));
         }
+
         return $this;
     }
 }

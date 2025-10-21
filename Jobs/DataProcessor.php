@@ -19,6 +19,7 @@ class DataProcessor
 
     public function processProducts(WorkflowContext $context, JobResult $result, array $inputs): array
     {
+        sleep(5);
         $this->logger->info('Processing products');
 
         $products = $inputs['products'] ?? [];

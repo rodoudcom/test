@@ -2,6 +2,7 @@
 
 namespace App\WorkflowRodoud\Contracts;
 
+use App\WorkflowRodoud\RetryConfig;
 use App\WorkflowRodoud\WorkflowContext;
 
 interface JobInterface
@@ -33,6 +34,10 @@ interface JobInterface
 
     public function addLog(string $log): void;
 
+    public function addError(string $log): void;
+
     public function setContext(WorkflowContext $context): self;
+
+    public function setRetryConfig(RetryConfig $retryConfig): self;
 
 }
