@@ -3,6 +3,8 @@
 namespace App\WorkflowRodoud;
 
 use App\WorkflowRodoud\Contracts\JobInterface;
+use App\WorkflowRodoud\Contracts\TrackerInterface;
+use App\WorkflowRodoud\Enum\WorkflowStatusEnum;
 use App\WorkflowRodoud\Services\WorkflowRedisTracker;
 
 /**
@@ -12,251 +14,212 @@ class WorkflowContext
 {
     private string $workflowId;
     private string $name;
-    private string $status = 'pending';
-    /**
-     * @var array<JobInterface> $steps
-     */
-    public array $steps = [];
-    public array $stepInputs = [];
-    public array $connections = [];
-    private array $results = [];
-    private array $executedJobs = [];
     private array $globals = [];
-    public ?string $startedAt = null;
-    private ?string $completedAt = null;
-    private array $performance = [];
-    private ?string $description = null;
-    public ?WorkflowRedisTracker $tracker = null;
+    private ?TrackerInterface $tracker = null;
+    private array $stepDefs = [];
+    private array $results = [];
+    private array $executed = [];
+    private WorkflowStatusEnum $status = WorkflowStatusEnum::RUNNING;
+    public bool $is_running = true;
+    private array $performance = ["start_time" => 0, "memory_used" => 0, "peak_memory" => 0, "end_time" => 0, "execution_time" => 0];
 
     public function __construct(string $workflowId, string $name)
     {
         $this->workflowId = $workflowId;
         $this->name = $name;
-        $this->performance = [
-            'start_memory' => memory_get_usage(),
-            'peak_memory' => memory_get_peak_usage(),
-            'total_memory_used' => 0,
-            'total_execution_time' => 0
-        ];
     }
 
-    // ============================================
-    // SETTERS - Update context state
-    // ============================================
-
-    public function setStatus(string $status): self
+    public function addStep(string $stepId, JobInterface $job, array $inputs = [], bool $stopOnFail = true): void
     {
-        $this->status = $status;
-        return $this;
+        $this->stepDefs[$stepId] = ['job' => $job, 'inputs' => $inputs, 'retry' => null, 'stopOnFail' => $stopOnFail, 'connections' => [], 'logs' => []];
+        $this->sync();
     }
 
-    public function setSteps(array $steps): self
+    public function connect(string $fromStep, string $toStep): void
     {
-        $this->steps = $steps;
-        return $this;
+        $this->stepDefs[$fromStep]['connections'][] = $toStep;
+        if (!isset($this->stepDefs[$toStep])) {
+            $this->stepDefs[$toStep] = ['job' => null, 'inputs' => [], 'retry' => null, 'stopOnFail' => true, 'connections' => [], 'logs' => []];
+        }
     }
 
-    public function setConnections(array $connections): self
+    public function setStepRetry(string $stepId, RetryConfig $retry): void
     {
-        $this->connections = $connections;
-        return $this;
+        $this->stepDefs[$stepId]['retry'] = $retry;
+
     }
 
-    public function setGlobals(array $globals): self
+    public function setGlobals(array $globals): void
     {
         $this->globals = $globals;
-        $this->context->syncToRedis();
-        return $this;
     }
 
-    public function setDescription(?string $description): self
+    public function getGlobal(string $var): mixed
     {
-        $this->description = $description;
-
-        return $this;
+        return $this->globals[$var] ?? null;
     }
 
-    public function markStarted(): self
+    public function setTracker(TrackerInterface $tracker): void
     {
-        $this->startedAt = microtime(true);
-        $this->status = 'running';
-        $this->context->syncToRedis();
-        return $this;
+        $this->tracker = $tracker;
     }
 
-    public function markCompleted(): self
+    public function markWorkflowStarted(): void
     {
-        $this->completedAt = microtime(true);
-        $this->status = 'completed';
-        $this->performance['peak_memory'] = memory_get_peak_usage();
-        $this->performance['total_memory_used'] = $this->performance['peak_memory'] - $this->performance['start_memory'];
-        $this->context->syncToRedis();
-        return $this;
+        $this->performance["start_time"] = microtime(true);
+        $this->is_running = true;
+        $this->status = WorkflowStatusEnum::RUNNING;
+        $this->sync();
     }
 
-    public function markFailed(): self
+    public function markWorkflowEnded(array $pref = [], WorkflowStatusEnum $status): void
     {
-        $this->completedAt = microtime(true);
-        $this->status = 'failed';
-        $this->context->syncToRedis();
-        return $this;
+        if ($this->is_running) {
+            $startTime = $this->performance["start_time"];
+            $endTime = microtime(true);
+            $timing = ["end_time" => $endTime, 'execution_time' => $endTime - $startTime];
+            $this->performance = array_merge($this->performance, $pref, $timing);
+            $this->status = $status;
+            $this->is_running = false;
+            $this->sync();
+        }
     }
 
-    public function setExecutionTime(float $time): self
+
+    public function markStepStarted(string $stepId): void
     {
-        $this->performance['total_execution_time'] = $time;
-        return $this;
+        $this->is_running = true;
+        $this->executed[$stepId]['status'] = WorkflowStatusEnum::RUNNING;
+        $this->executed[$stepId]['performance']["start_time"] = microtime(true);
+        $this->sync();
     }
 
-    // ============================================
-    // JOB TRACKING
-    // ============================================
-
-    public function addExecutedJob(array $jobData): self
+    public function markStepCompleted(string $stepId, mixed $result, array $logs = [], array $pref = []): void
     {
-        $this->executedJobs[$jobData["name"]] = $jobData;
-        $this->context->syncToRedis();
-        return $this;
+        $startTime = $this->executed[$stepId]['performance']["start_time"];
+        $endTime = microtime(true);
+        $timing = ["end_time" => $endTime, 'execution_time' => $endTime - $startTime];
+
+        $this->executed[$stepId]['status'] = WorkflowStatusEnum::SUCCESS;
+        $this->executed[$stepId]['performance'] = array_merge($this->executed[$stepId]['performance'] ?? [], $pref, $timing);
+        $this->executed[$stepId]['logs'] = array_merge($this->executed[$stepId]['logs'] ?? [], $logs);
+        $this->results[$stepId] = $result;
+        $this->sync();
     }
 
-    public function updateExecutedJob(string $jobName, array $updates): self
+    public function markStepFailed(string $stepId, array $error, array $pref = []): void
     {
-        $this->executedJobs[$jobName] = array_merge($this->executedJobs[$jobName], $updates);
-        $this->context->syncToRedis();
-        return $this;
+        $startTime = $this->executed[$stepId]['performance']["start_time"];
+        $endTime = microtime(true);
+        $timing = ["end_time" => $endTime, 'execution_time' => $endTime - $startTime];
+
+        $this->executed[$stepId]['status'] = WorkflowStatusEnum::FAIL;
+        $this->executed[$stepId]['error'] = $error;
+        $this->executed[$stepId]['performance'] = array_merge($this->executed[$stepId]['performance'] ?? [], $pref, $timing);
+        $this->sync();
     }
 
-    public function findExecutedJob(string $jobName): ?array
+    public function getStepJob(string $stepId): ?JobInterface
     {
-        return $this->executedJobs[$jobName] ?? null;
+        return $this->stepDefs[$stepId]['job'] ?? null;
     }
 
-    public function addJobLog(string $jobName, string $message): self
+    public function getStepRetryConfig(string $stepId): ?RetryConfig
     {
-
-        $this->executedJobs[$jobName]['logs'][] = '[' . date('c') . '] ' . $message;
-
-        return $this;
+        return $this->stepDefs[$stepId]['retry'] ?? null;
     }
 
-    public function addError(string $jobName, string $error): self
+    public function getStepStopOnFail(string $stepId): bool
     {
-
-        $this->executedJobs[$jobName]['errors'][] = $error;
-
-        return $this;
+        return $this->stepDefs[$stepId]['stopOnFail'] ?? true;
     }
 
-    // ============================================
-    // RESULTS
-    // ============================================
-
-    public function setResult(string $stepName, $result): self
+    public function getStepConnections(string $stepId): array
     {
-        $this->results[$stepName] = $result;
-        $this->context->syncToRedis();
-        return $this;
+        return $this->stepDefs[$stepId]['connections'] ?? [];
     }
 
-    public function getResult(string $stepName)
+    public function getStatus(): WorkflowStatusEnum
     {
-        return $this->results[$stepName] ?? null;
+        return $this->status;
     }
 
-    public function getAllResults(): array
+    public function resolveInputs(string $stepId): array
+    {
+        $inputs = $this->stepDefs[$stepId]['inputs'] ?? [];
+        $resolved = [];
+        foreach ($inputs as $key => $val) {
+            if (is_array($val)) {
+                foreach ($val as $src => $field) {
+                    $resolved[$key] = $this->results[$src][$field] ?? null;
+                }
+            } else {
+                $resolved[$key] = $this->results[$val] ?? null;
+            }
+        }
+        return array_merge($this->globals, $resolved);
+    }
+
+    private function sync(): void
+    {
+        if ($this->tracker) {
+            $this->tracker->track($this->workflowId, $this->toArray());
+        }
+    }
+
+    public function getStepIds(): array
+    {
+        return array_keys($this->stepDefs);
+    }
+
+    public function getResults(): array
     {
         return $this->results;
     }
-
-    // ============================================
-    // GETTERS
-    // ============================================
 
     public function getWorkflowId(): string
     {
         return $this->workflowId;
     }
 
-    public function getName(): string
-    {
-        return $this->name;
-    }
-
-    public function getStatus(): string
-    {
-        return $this->status;
-    }
-
-    public function getSteps(): array
-    {
-        return $this->steps;
-    }
-
-    public function getConnections(): array
-    {
-        return $this->connections;
-    }
-
-    public function getGlobals(): array
-    {
-        return $this->globals;
-    }
-
-    public function getGlobal(string $key, $default = null)
-    {
-        return $this->globals[$key] ?? $default;
-    }
-
-    public function getExecutedJobs(): array
-    {
-        return $this->executedJobs;
-    }
-
-    public function getPerformance(): array
-    {
-        return $this->performance;
-    }
-
-    // ============================================
-    // REDIS SYNC
-    // ============================================
-
-    /**
-     * Sync current context to Redis (if tracker is set)
-     */
-    public function syncToRedis(): void
-    {
-        if ($this->tracker && $this->tracker->isEnabled()) {
-            $this->tracker->sync($this);
-        }
-    }
-
-
-
-    // ============================================
-    // EXPORT - Convert to array for Redis/DB
-    // ============================================
 
     public function toArray(): array
     {
+
         return [
             'workflow_id' => $this->workflowId,
             'name' => $this->name,
-            'status' => $this->status,
-            'description' => $this->description,
-            'steps' => array_map(fn($step) => $step->toArray(), $this->steps),
-            'stepInputs' => $this->stepInputs,
-            'connections' => $this->connections,
+            'status' => $this->status->value,
+            'globals' => $this->globals,
+            'performance' => $this->performance,
+            'steps' => array_map(function ($stepId) {
+                $step = $this->stepDefs[$stepId];
+                return [
+                    'name' => $stepId,
+                    'job' => $step['job']?->getName() ?? null,
+                    'inputs' => $step['inputs'] ?? [],
+                    'retry' => $step['retry'] ? [
+                        'maxAttempts' => $step['retry']->maxAttempts,
+                        'baseDelay' => $step['retry']->baseDelay,
+                        'multiplier' => $step['retry']->multiplier
+                    ] : null,
+                    'stopOnFail' => $step['stopOnFail'] ?? true,
+                    'connections' => $step['connections'] ?? [],
+                ];
+            }, array_keys($this->stepDefs)),
             'results' => $this->results,
-            'executed_jobs' => $this->executedJobs,
-            'started_at' => $this->startedAt,
-            'completed_at' => $this->completedAt,
-            'performance' => $this->performance
+            'executed_jobs' => $this->executed,
         ];
     }
 
-    public function toJson(): string
+    public function addLog(string $stepId, string $log)
     {
-        return json_encode($this->toArray());
+        $this->executed[$stepId]['logs'][] = $log;
     }
+
+    public function setLogs(string $stepId, array $logs)
+    {
+        $this->executed[$stepId]['logs'] = $logs;
+    }
+
 }

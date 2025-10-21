@@ -3,356 +3,381 @@
 namespace App\WorkflowRodoud;
 
 
-use App\WorkflowRodoud\Contracts\JobInterface;
-use App\WorkflowRodoud\Contracts\WorkflowSummaryCallbackInterface;
-use App\WorkflowRodoud\Services\WorkflowRedisTracker;
-
 /**
- * Workflow - Main workflow execution engine
+ * Refactored Workflow orchestrator
  *
- * PRIMARY: Works with in-memory WorkflowContext
- * OPTIONAL: Syncs to Redis via WorkflowRedisTracker for real-time debugging
+ * Responsibilities:
+ * - Orchestrates execution of steps defined in a WorkflowContext
+ * - Builds execution groups from ->connect relationships so independent steps run in parallel
+ * - Runs groups sequentially (workflow is synchronous by default)
+ * - Handles per-step retry (RetryConfig) and stopOnFail behavior
+ * - Collects and merges job logs/errors into the WorkflowContext so the tracker can stream updates
+ *
+ * Requirements:
+ * - WorkflowContext implementation (see your project) that exposes methods used below
+ * - Jobs that implement JobInterface (and optionally extend BaseJob to use job logs/errors)
+ * - amphp/amp installed for simple Promise utilities (used only to run group promises in parallel)
+ *
+ * Notes:
+ * - This class assumes WorkflowContext::markStepStarted/Completed/Failed accept logs and errors
+ *   and that Job implementations append logs/errors via BaseJob methods.
+ * - Workflow execution is synchronous at workflow level; parallelism only happens inside groups.
  */
+
+use App\WorkflowRodoud\Contracts\JobInterface;
+use App\WorkflowRodoud\Contracts\TrackerInterface;
+use App\WorkflowRodoud\Contracts\WorkflowSummaryCallbackInterface;
+use App\WorkflowRodoud\Enum\WorkflowStatusEnum;
+use App\WorkflowRodoud\Exception\WorkflowException;
+use function Amp\async;
+
+
 class Workflow
 {
     private WorkflowContext $context;
     private ?WorkflowSummaryCallbackInterface $summaryCallback = null;
 
-    public function __construct(string $name)
+    /**
+     * Create workflow attached to an existing context or create a new one from name.
+     * @param WorkflowContext|string $contextOrName
+     */
+    public function __construct(WorkflowContext|string $contextOrName)
     {
-        $workflowId = $this->generateWorkflowId();
-        $this->context = new WorkflowContext($workflowId, $name);
+        if ($contextOrName instanceof WorkflowContext) {
+            $this->context = $contextOrName;
+        } else {
+            $id = bin2hex(random_bytes(8));
+            $this->context = new WorkflowContext($id, $contextOrName);
+        }
     }
 
-    // ============================================
-    // CONFIGURATION
-    // ============================================
-
-    /**
-     * Set optional Redis tracker for real-time monitoring
-     */
-    public function setTracker(WorkflowRedisTracker $tracker): self
+    /*
+    * @param string $stepId
+    * @param JobInterface $job
+    * @param array $inputs  // mapping of inputs like ["instruction" => ["prepareInstruction"=>"instruction"]]
+    * @param bool $stopOnFail default true
+    * @return $this
+    */
+    public function addStep(string $stepId, JobInterface $job, array $inputs = [], bool $stopOnFail = true): self
     {
-        $this->context->tracker = $tracker;
+        $this->context->addStep($stepId, $job, $inputs, $stopOnFail);
         return $this;
     }
 
     /**
-     * Set global variables accessible to all jobs
+     * Connect two steps (from -> to). Delegates to context.
+     * @param string $from
+     * @param string $to
+     * @return $this
      */
-    public function setGlobals(array $globals): self
+    public function connect(string $from, string $to): self
     {
-        $this->context->setGlobals($globals);
-
+        $this->context->connect($from, $to);
         return $this;
     }
 
-    /**
-     * Set workflow description
-     */
-    public function setDescription(string $description): self
-    {
-        $this->context->setDescription($description);
 
+    /**
+     * Apply retry to the last added step (convenience).
+     */
+    public function withRetry(int $maxAttempts, float $baseDelay = 0.0, float $multiplier = 1.0): self
+    {
+        $ids = $this->context->getStepIds();
+        if (!empty($ids)) {
+            $last = array_pop($ids);
+            $this->context->setStepRetry($last, new RetryConfig($maxAttempts, $baseDelay, $multiplier));
+        }
         return $this;
     }
 
-    /**
-     * Set callback to persist workflow result
-     */
-    public function setSummaryCallback(WorkflowSummaryCallbackInterface $callback): self
+
+    /** Set tracker on the underlying context */
+    public function setTracker(TrackerInterface $tracker): self
     {
-        $this->summaryCallback = $callback;
+        $this->context->setTracker($tracker);
         return $this;
     }
 
-    // ============================================
-    // WORKFLOW BUILDING
-    // ============================================
-
-    /**
-     * Add a step/job to workflow
-     */
-    public function addStep(string $stepId, JobInterface $job, array $inputs = []): self
+    /** Set optional summary callback (called at end with context->toArray() or getResults()) */
+    public function setSummaryCallback(WorkflowSummaryCallbackInterface $cb): self
     {
-        $this->context->steps[$stepId] = $job;
-        $this->context->stepInputs[$stepId] = $inputs;
+        $this->summaryCallback = $cb;
         return $this;
     }
 
-    /**
-     * Connect two steps (for visualization) and for stops order
-     */
-    public function connect(string $fromStep, string $toStep): self
-    {
-        $this->context->connections[] = [
-            'from' => $fromStep,
-            'to' => $toStep
-        ];
-        return $this;
-    }
 
-    // ============================================
-    // EXECUTION
-    // ============================================
-
-    /**
-     * Execute the workflow
-     */
-    public function execute(): array
-    {
-
-
-        // Mark workflow as started
-        $this->context->markStarted();
-
-
-        try {
-            // Execute steps in dependency order
-            //TODO excute in connect order
-            $executionOrder = $this->resolveExecutionOrder();
-            $results = [];
-
-            foreach ($executionOrder as $stepId) {
-
-                $job = $this->context->steps[$stepId];
-
-                // Execute step
-                $result = $this->executeStep($stepId, $job);
-                $results[$stepId] = $result;
-
-                // Store result in context
-                $this->context->setResult($stepId, $result);
-            }
-
-            // Mark workflow as completed
-            $this->completeWorkflow();
-
-            return $results;
-
-        } catch (\Throwable $e) {
-            // Mark workflow as failed
-            $this->context->markFailed();
-            throw $e;
-        }
-    }
-
-    /**
-     * Execute a single step
-     */
-    private function executeStep(string $stepId, JobInterface $job)
-    {
-        $startTime = microtime(true);
-        $startMemory = memory_get_usage();
-
-        // Prepare inputs from dependencies
-        $inputs = $this->resolveStepInputs($stepId);
-
-        // Add job to executed_jobs as "running"
-        $this->context->addExecutedJob([
-            'name' => $stepId,
-            'status' => 'running',
-            'inputs' => $inputs,
-            'outputs' => null,
-            'logs' => [],
-            'error' => [],
-            'started_at' => microtime(true),
-            'completed_at' => null,
-            'performance' => [
-                'execution_time' => 0,
-                'memory_used' => 0,
-                'peak_memory' => memory_get_peak_usage()
-            ]
-        ]);
-
-
-        try {
-            // Execute the job
-            $result = $this->callJob($job, $inputs, $stepId);
-
-            $executionTime = microtime(true) - $startTime;
-            $memoryUsed = memory_get_usage() - $startMemory;
-
-            // Update job as "completed"
-            $this->context->updateExecutedJob($stepId, [
-                'status' => 'completed',
-                'outputs' => $result,
-                'completed_at' => microtime(true),
-                'performance' => [
-                    'execution_time' => $executionTime,
-                    'memory_used' => $memoryUsed,
-                    'peak_memory' => memory_get_peak_usage()
-                ]
-            ]);
-
-
-            return $result;
-
-        } catch (\Throwable $e) {
-            // Update job as "failed"
-            $this->context->updateExecutedJob($stepId, [
-                'status' => 'failed',
-                'error' => $e->getMessage(),
-                'completed_at' => microtime(true)
-            ]);
-
-
-            throw $e;
-        }
-    }
-
-    /**
-     * Call the job with inputs
-     */
-    private function callJob(JobInterface $job, array $inputs, string $stepId = ''): mixed
-    {
-        $lastException = null;
-        $attempt = 0;
-        //  while ($attempt < $job->retryConfig->maxAttempts) {
-        $result = $job->setId($stepId)
-            ->setContext($this->context)
-            ->execute($inputs);
-        //}
-        return $result;
-    }
-
-    /**
-     * Resolve step inputs from dependencies
-     */
-    private function resolveStepInputs(string $stepId): array
-    {
-        $inputs = [];
-        $dependencies = $this->context->stepInputs[$stepId] ?? [];
-
-        foreach ($dependencies as $key => $dependency) {
-            if (is_array($dependency)) {
-                // Format: 'key' => ['stepId' => 'outputKey']
-                foreach ($dependency as $sourceStep => $outputKey) {
-                    $result = $this->context->getResult($sourceStep);
-                    $inputs[$key] = $result[$outputKey] ?? null;
-                }
-            } else {
-                // Simple format: 'stepId'
-                $inputs[$key] = $this->context->getResult($dependency);
-            }
-        }
-
-        return $inputs;
-    }
-
-    /**
-     * Resolve execution order based on dependencies
-     */
-    //TODO order should be depend on connector
-    private function resolveExecutionOrder(): array
-    {
-        // Simple topological sort
-        $order = [];
-        $visited = [];
-
-        $visit = function ($stepId) use (&$visit, &$order, &$visited) {
-            if (isset($visited[$stepId])) {
-                return;
-            }
-
-            $visited[$stepId] = true;
-
-            // Visit dependencies first
-            $deps = $this->context->stepInputs[$stepId] ?? [];
-            foreach ($deps as $dep) {
-                if (is_array($dep)) {
-                    foreach ($dep as $sourceStep => $outputKey) {
-                        $visit($sourceStep);
-                    }
-                } else {
-                    $visit($dep);
-                }
-            }
-
-            $order[] = $stepId;
-        };
-
-        foreach (array_keys($this->context->steps) as $stepId) {
-            $visit($stepId);
-        }
-
-        return $order;
-    }
-
-
-    /**
-     * Complete workflow execution
-     */
-    private function completeWorkflow(): void
-    {
-        $executionTime = microtime(true) - $this->context->startedAt;
-
-        $this->context->setExecutionTime($executionTime);
-        $this->context->markCompleted();
-
-        // Set Redis expiry
-        if ($this->context->tracker) {
-            $this->context->tracker->setExpiry($this->context->getWorkflowId(), 3600);
-        }
-
-        // Call summary callback if set
-        if ($this->summaryCallback) {
-            $this->summaryCallback->handle($this->getSummary());
-        }
-    }
-
-
-
-    // ============================================
-    // GETTERS
-    // ============================================
-
+    /** Get current workflow context */
     public function getContext(): WorkflowContext
     {
         return $this->context;
     }
 
-    public function getWorkflowId(): string
+
+    public function setGlobals(array $globales): self
     {
-        return $this->context->getWorkflowId();
-    }
-
-    public function getSummary(): array
-    {
-        return $this->context->toArray();
-    }
-
-
-    // ============================================
-    // UTILITIES
-    // ============================================
-
-    private function generateWorkflowId(): string
-    {
-        return sprintf(
-            '%04x%04x-%04x-%04x-%04x-%04x%04x%04x',
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff),
-            mt_rand(0, 0xffff),
-            mt_rand(0, 0x0fff) | 0x4000,
-            mt_rand(0, 0x3fff) | 0x8000,
-            mt_rand(0, 0xffff), mt_rand(0, 0xffff), mt_rand(0, 0xffff)
-        );
-    }
-
-
-    /**
-     * Configure retry for the last added step
-     */
-    public function withRetry(int $maxAttempts, float $baseDelay = 1.0, float $multiplier = 2.0): self
-    {
-        /**
-         * @var JobInterface $lastStep
-         */
-        $lastStep = end($this->context->steps);
-        if ($lastStep) {
-            $lastStep->setRetryConfig(new RetryConfig($maxAttempts, $baseDelay, $multiplier));
-        }
-
+        $this->context->setGlobals($globales);
         return $this;
     }
+
+    /**
+     * Execute the workflow synchronously.
+     * Steps are grouped based on ->connect relationships. Groups run sequentially.
+     * Steps inside a group run in parallel.
+     *
+     * @return array results keyed by step id
+     * @throws \Throwable On a step failure when stopOnFail is true.
+     */
+    public function execute(): array
+    {
+        $groups = $this->buildExecutionGroups();
+        $allResults = [];
+
+        $this->context->markWorkflowStarted();
+        foreach ($groups as $group) {
+
+            // Build async operations for the group
+            $futures = [];
+
+            foreach ($group as $stepId) {
+                if (!$this->context->is_running) continue; //the workflow already stopped
+                $job = $this->context->getStepJob($stepId);
+
+                if (!($job instanceof JobInterface)) {
+                    // No-op step: mark as completed with null result
+                    $this->context->markStepStarted($stepId);
+                    $this->context->markStepCompleted($stepId, null, []);
+                    $allResults[$stepId] = null;
+                    continue;
+                }
+
+                $job->setId($stepId);
+
+                // Each step executed as a Future so we can await all in the group
+                $futures[$stepId] = async(function () use ($job) {
+                    return $this->runStepWithRetry($job);
+                });
+            }
+
+            // Wait for group completion (parallel execution)
+            $groupResults = [];
+            if (!empty($futures)) {
+                // Await all futures in parallel
+                $groupResults = \Amp\Future\await($futures);
+            }
+
+            // Merge results
+            foreach ($groupResults as $s => $r) {
+                $allResults[$s] = $r;
+            }
+        }
+
+
+        $perf = [
+            'memory_used' => memory_get_usage(),
+            'peak_memory' => memory_get_peak_usage(),
+        ];
+
+        $this->context->markWorkflowEnded($perf, WorkflowStatusEnum::SUCCESS);
+
+
+        // optional summary callback
+        if ($this->summaryCallback instanceof WorkflowSummaryCallbackInterface) {
+            try {
+                $this->summaryCallback->handle($this->getSummary());
+            } catch (\Throwable $e) {
+                // ignore summary callback errors
+            }
+        }
+
+
+        return $allResults;
+    }
+
+    /**
+     * Run a step with retry logic. It will update context on start, each retry attempt, completion or failure.
+     * Throws if all attempts failed and stopOnFail is true.
+     *
+     * @param JobInterface $job
+     * @return mixed
+     * @throws \Throwable
+     */
+    private function runStepWithRetry(JobInterface $job): mixed
+    {
+        $this->context->markStepStarted($job->getId());
+
+        $retryConfig = $this->context->getStepRetryConfig($job->getId());
+        $attempts = $retryConfig?->maxAttempts ?? 1;
+        $baseDelay = $retryConfig?->baseDelay ?? 0.0;
+        $mult = $retryConfig?->multiplier ?? 1.0;
+
+        $lastException = null;
+
+
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+
+            // resolve inputs fresh for each attempt
+            $inputs = $this->context->resolveInputs($job->getId());;
+
+            try {
+                $result = $job->run($inputs, $this->context);
+                $this->context->setLogs($job->getId(), $job->getLogs());
+
+                // if job reports errors via BaseJob, treat as failure
+                if ($job instanceof BaseJob && $job->hasErrors()) {
+                    $this->context->markStepFailed($job->getId(), $job->getErrors());
+                    throw new WorkflowException("");
+                }
+
+                // on success, mark completed and push logs
+                $perf = [
+                    'memory_used' => memory_get_usage(),
+                    'peak_memory' => memory_get_peak_usage(),
+                ];
+
+
+                $this->context->markStepCompleted($job->getId(), $result, [], $perf);
+
+                return $result;
+            } catch (\Throwable $e) {
+                $lastException = $e;
+
+
+
+                // merge logs into executed step data and record failure for this attempt
+                if (!($e instanceof WorkflowException)){
+                    $this->context->markStepFailed($job->getId(), [$e->getMessage()]);
+                    $this->context->addLog($job->getId(), '[Error] Attempt ' . $attempt . ' failed: ' . $e->getMessage());
+
+                }
+
+
+                // if this is last attempt, decide whether to stop or continue
+                $isLastAttempt = $attempt >= $attempts;
+                $stopOnFail = $this->context->getStepStopOnFail($job->getId());
+
+                if ($isLastAttempt) {
+                    if ($stopOnFail) {
+                        // bubble exception to stop entire workflow
+                        $perf = [
+                            'memory_used' => memory_get_usage(),
+                            'peak_memory' => memory_get_peak_usage(),
+                        ];
+                        $this->context->markWorkflowEnded($perf, WorkflowStatusEnum::FAIL);
+                        return null;
+                    }
+
+                    $perf = [
+                        'memory_used' => memory_get_usage(),
+                        'peak_memory' => memory_get_peak_usage(),
+                    ];
+                    // stopOnFail == false => mark completed with null and continue
+                    $this->context->markStepFailed($job->getId(), [], $perf);
+                    return null;
+                }
+
+                // not last attempt: wait according to backoff before retrying
+                $delay = $baseDelay * ($mult ** ($attempt - 1));
+                if ($delay > 0) {
+                    usleep((int)($delay * 1_000_000));
+                }
+
+                // continue next attempt
+            }
+        }
+
+        // should not reach here, but rethrow if it does
+        if ($lastException) throw $lastException;
+        return null;
+    }
+
+    /**
+     * Collect job logs if job implements BaseJob or provides getLogs().
+     * Always return an array (possibly empty).
+     *
+     * @param JobInterface $job
+     * @return array
+     */
+    private function collectJobLogs(JobInterface $job): array
+    {
+        if ($job instanceof BaseJob) {
+            return $job->getLogs();
+        }
+
+        // attempt generic getter
+        if (method_exists($job, 'getLogs')) {
+            $logs = $job->getLogs();
+            if (is_array($logs)) return $logs;
+        }
+
+        return [];
+    }
+
+    /**
+     * Build execution groups using Kahn's algorithm on the connect graph.
+     * Each group is a list of steps that have no pending parents and therefore can run in parallel.
+     *
+     * @return array<int, string[]>
+     */
+    private function buildExecutionGroups(): array
+    {
+        $steps = $this->context->getStepIds();
+        $inDegree = array_fill_keys($steps, 0);
+        $edges = [];
+
+        // build edges and indegree based on connections (from -> to)
+        foreach ($steps as $s) {
+            foreach ($this->context->getStepConnections($s) as $to) {
+                $edges[$s][] = $to;
+                $inDegree[$to] = ($inDegree[$to] ?? 0) + 1;
+            }
+        }
+
+        // initial queue: nodes with indegree 0
+        $queue = [];
+        foreach ($inDegree as $node => $deg) {
+            if ($deg === 0) $queue[] = $node;
+        }
+
+        $groups = [];
+        $visited = [];
+
+        while (!empty($queue)) {
+            // current group = all nodes in queue
+            $group = [];
+            foreach ($queue as $node) {
+                if (in_array($node, $visited, true)) continue;
+                $group[] = $node;
+                $visited[] = $node;
+            }
+
+            $groups[] = $group;
+
+            // prepare next queue
+            $next = [];
+            foreach ($group as $node) {
+                foreach ($edges[$node] ?? [] as $m) {
+                    $inDegree[$m]--;
+                    if ($inDegree[$m] === 0) $next[] = $m;
+                }
+            }
+
+            $queue = $next;
+        }
+
+        // if cycle detected (some nodes not visited), append remaining nodes as final group
+        if (count($visited) !== count($steps)) {
+            foreach ($steps as $s) {
+                if (!in_array($s, $visited, true)) $groups[] = [$s];
+            }
+        }
+
+        return $groups;
+    }
+
+
+    public function getSummary(): mixed
+    {
+        return ($this->context->toArray());
+    }
 }
+

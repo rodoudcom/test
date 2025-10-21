@@ -7,26 +7,14 @@ namespace App\WorkflowRodoud;
 
 class RetryConfig
 {
-    public int $maxAttempts = 1;
-    public float $baseDelay = 1.0; // seconds
-    public float $multiplier = 2.0; // exponential backoff
-    public float $maxDelay = 60.0; // max delay in seconds
+    public int $maxAttempts;
+    public float $baseDelay;
+    public float $multiplier;
 
-    public function __construct(
-        int $maxAttempts = 1,
-        float $baseDelay = 1.0,
-        float $multiplier = 2.0,
-        float $maxDelay = 60.0
-    ) {
-        $this->maxAttempts = $maxAttempts;
-        $this->baseDelay = $baseDelay;
-        $this->multiplier = $multiplier;
-        $this->maxDelay = $maxDelay;
-    }
-
-    public function getDelay(int $attempt): float
+    public function __construct(int $maxAttempts = 1, float $baseDelay = 0.0, float $multiplier = 1.0)
     {
-        $delay = $this->baseDelay * pow($this->multiplier, $attempt - 1);
-        return min($delay, $this->maxDelay);
+        $this->maxAttempts = max(1, $maxAttempts);
+        $this->baseDelay = max(0.0, $baseDelay);
+        $this->multiplier = max(1.0, $multiplier);
     }
 }
