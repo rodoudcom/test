@@ -186,6 +186,7 @@ class WorkflowContext
     public function toArray(): array
     {
 
+
         return [
             'workflow_id' => $this->workflowId,
             'name' => $this->name,
@@ -197,6 +198,7 @@ class WorkflowContext
                 return [
                     'name' => $stepId,
                     'job' => $step['job']?->getName() ?? null,
+                    'description' => $step['job']?->getDescription() ?? null,
                     'inputs' => $step['inputs'] ?? [],
                     'retry' => $step['retry'] ? [
                         'maxAttempts' => $step['retry']->maxAttempts,
