@@ -73,47 +73,7 @@ class JobRunner
         return $results;
     }
 
-    /**
-     * Execute jobs sequentially (sync)
-     * @param array $jobs Array of [stepId => JobInterface]
-     * @param WorkflowContext $context
-     * @return array Results keyed by stepId
-     */
-    public function sync(array $jobs, WorkflowContext $context): array
-    {
-        if (empty($jobs)) {
-            return [];
-        }
 
-        $results = [];
-
-        foreach ($jobs as $stepId => $job) {
-            $jobData = $this->prepareJobData($stepId, $job, $context);
-            $tempFile = $this->createTempFile($jobData);
-
-            $process = new Process([
-                $this->phpBinary,
-                $this->workerScript,
-                $tempFile
-            ]);
-
-            $process->setTimeout(300);
-            $process->start();
-            $process->wait();
-
-            $results[$stepId] = $this->processOutput(
-                $stepId,
-                $process->getOutput(),
-                $process->getErrorOutput(),
-                $process->isSuccessful()
-            );
-
-            // Cleanup
-            @unlink($tempFile);
-        }
-
-        return $results;
-    }
 
     /**
      * Prepare job data for serialization
