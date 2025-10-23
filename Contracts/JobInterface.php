@@ -10,4 +10,6 @@ interface JobInterface
     public function run(array $inputs, WorkflowContext $context): mixed;
     public function getId(): string;
     public function setId(string $id): self;
+
+    public function toArray();
 }

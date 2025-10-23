@@ -5,23 +5,25 @@ namespace App\WorkflowRodoud;
 use App\WorkflowRodoud\Contracts\JobInterface;
 use App\WorkflowRodoud\Contracts\TrackerInterface;
 use App\WorkflowRodoud\Enum\WorkflowStatusEnum;
-use App\WorkflowRodoud\Services\WorkflowRedisTracker;
 
-/**
- * Context holds all workflow data and results
- */
 class WorkflowContext
 {
-    private string $workflowId;
+    public string $workflowId;
     private string $name;
-    private array $globals = [];
+    public array $globals = [];
     private ?TrackerInterface $tracker = null;
     private array $stepDefs = [];
     private array $results = [];
     private array $executed = [];
     private WorkflowStatusEnum $status = WorkflowStatusEnum::RUNNING;
     public bool $is_running = true;
-    private array $performance = ["start_time" => 0, "memory_used" => 0, "peak_memory" => 0, "end_time" => 0, "execution_time" => 0];
+    private array $performance = [
+        "start_time" => 0,
+        "memory_used" => 0,
+        "peak_memory" => 0,
+        "end_time" => 0,
+        "execution_time" => 0
+    ];
 
     public function __construct(string $workflowId, string $name)
     {
@@ -31,7 +33,15 @@ class WorkflowContext
 
     public function addStep(string $stepId, JobInterface $job, array $inputs = [], bool $stopOnFail = true): void
     {
-        $this->stepDefs[$stepId] = ['job' => $job, 'inputs' => $inputs, 'retry' => null, 'stopOnFail' => $stopOnFail, 'connections' => [], 'logs' => []];
+        $this->stepDefs[$stepId] = [
+            'job' => $job,
+            'inputs' => $inputs,
+            'retry' => null,
+            'timeout' => null, // NEW
+            'stopOnFail' => $stopOnFail,
+            'connections' => [],
+            'logs' => []
+        ];
         $this->sync();
     }
 
@@ -39,14 +49,47 @@ class WorkflowContext
     {
         $this->stepDefs[$fromStep]['connections'][] = $toStep;
         if (!isset($this->stepDefs[$toStep])) {
-            $this->stepDefs[$toStep] = ['job' => null, 'inputs' => [], 'retry' => null, 'stopOnFail' => true, 'connections' => [], 'logs' => []];
+            $this->stepDefs[$toStep] = [
+                'job' => null,
+                'inputs' => [],
+                'retry' => null,
+                'timeout' => null,
+                'stopOnFail' => true,
+                'connections' => [],
+                'logs' => []
+            ];
         }
     }
 
     public function setStepRetry(string $stepId, RetryConfig $retry): void
     {
         $this->stepDefs[$stepId]['retry'] = $retry;
+    }
 
+    /**
+     * Set timeout for a step (in seconds)
+     */
+    public function setStepTimeout(string $stepId, float $timeout): void
+    {
+        $this->stepDefs[$stepId]['timeout'] = $timeout;
+    }
+
+    /**
+     * Get timeout for a step
+     */
+    public function getStepTimeout(string $stepId): ?float
+    {
+        return $this->stepDefs[$stepId]['timeout'] ?? null;
+    }
+
+    /**
+     * Clear connections for a step (used for dynamic routing)
+     */
+    public function clearStepConnections(string $stepId): void
+    {
+        if (isset($this->stepDefs[$stepId])) {
+            $this->stepDefs[$stepId]['connections'] = [];
+        }
     }
 
     public function setGlobals(array $globals): void
@@ -57,6 +100,11 @@ class WorkflowContext
     public function getGlobal(string $var): mixed
     {
         return $this->globals[$var] ?? null;
+    }
+
+    public function getGlobals():array
+    {
+        return $this->globals;
     }
 
     public function setTracker(TrackerInterface $tracker): void
@@ -72,19 +120,21 @@ class WorkflowContext
         $this->sync();
     }
 
-    public function markWorkflowEnded(array $pref = [], WorkflowStatusEnum $status): void
+    public function markWorkflowEnded(array $pref, WorkflowStatusEnum $status): void
     {
         if ($this->is_running) {
             $startTime = $this->performance["start_time"];
             $endTime = microtime(true);
-            $timing = ["end_time" => $endTime, 'execution_time' => $endTime - $startTime];
+            $timing = [
+                "end_time" => $endTime,
+                'execution_time' => $endTime - $startTime
+            ];
             $this->performance = array_merge($this->performance, $pref, $timing);
             $this->status = $status;
             $this->is_running = false;
             $this->sync();
         }
     }
-
 
     public function markStepStarted(string $stepId): void
     {
@@ -98,11 +148,21 @@ class WorkflowContext
     {
         $startTime = $this->executed[$stepId]['performance']["start_time"];
         $endTime = microtime(true);
-        $timing = ["end_time" => $endTime, 'execution_time' => $endTime - $startTime];
+        $timing = [
+            "end_time" => $endTime,
+            'execution_time' => $endTime - $startTime
+        ];
 
         $this->executed[$stepId]['status'] = WorkflowStatusEnum::SUCCESS;
-        $this->executed[$stepId]['performance'] = array_merge($this->executed[$stepId]['performance'] ?? [], $pref, $timing);
-        $this->executed[$stepId]['logs'] = array_merge($this->executed[$stepId]['logs'] ?? [], $logs);
+        $this->executed[$stepId]['performance'] = array_merge(
+            $this->executed[$stepId]['performance'] ?? [],
+            $pref,
+            $timing
+        );
+        $this->executed[$stepId]['logs'] = array_merge(
+            $this->executed[$stepId]['logs'] ?? [],
+            $logs
+        );
         $this->results[$stepId] = $result;
         $this->sync();
     }
@@ -111,11 +171,18 @@ class WorkflowContext
     {
         $startTime = $this->executed[$stepId]['performance']["start_time"];
         $endTime = microtime(true);
-        $timing = ["end_time" => $endTime, 'execution_time' => $endTime - $startTime];
+        $timing = [
+            "end_time" => $endTime,
+            'execution_time' => $endTime - $startTime
+        ];
 
         $this->executed[$stepId]['status'] = WorkflowStatusEnum::FAIL;
         $this->executed[$stepId]['error'] = $error;
-        $this->executed[$stepId]['performance'] = array_merge($this->executed[$stepId]['performance'] ?? [], $pref, $timing);
+        $this->executed[$stepId]['performance'] = array_merge(
+            $this->executed[$stepId]['performance'] ?? [],
+            $pref,
+            $timing
+        );
         $this->sync();
     }
 
@@ -182,11 +249,8 @@ class WorkflowContext
         return $this->workflowId;
     }
 
-
     public function toArray(): array
     {
-
-
         return [
             'workflow_id' => $this->workflowId,
             'name' => $this->name,
@@ -205,6 +269,7 @@ class WorkflowContext
                         'baseDelay' => $step['retry']->baseDelay,
                         'multiplier' => $step['retry']->multiplier
                     ] : null,
+                    'timeout' => $step['timeout'] ?? null, // NEW
                     'stopOnFail' => $step['stopOnFail'] ?? true,
                     'connections' => $step['connections'] ?? [],
                 ];
@@ -214,14 +279,15 @@ class WorkflowContext
         ];
     }
 
-    public function addLog(string $stepId, string $log)
+    public function addLog(string $stepId, string $log): void
     {
         $this->executed[$stepId]['logs'][] = $log;
     }
 
-    public function setLogs(string $stepId, array $logs)
+    public function setLogs(string $stepId, array $logs): void
     {
         $this->executed[$stepId]['logs'] = $logs;
     }
+
 
 }

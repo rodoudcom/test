@@ -77,5 +77,31 @@ abstract class BaseJob implements JobInterface
         $this->id = $id;
         return $this;
     }
+    public function toArray(): array
+    {
+        return [
+            'class' => get_class($this),
+            'id' => $this->id,
+            'errors' => $this->jobErrors,
+            'logs' => $this->jobLogs,
+        ];
+    }
+
+    public static function fromArray(array $data): JobInterface
+    {
+        $class = $data['class'];
+        if (!class_exists($class)) {
+            throw new \InvalidArgumentException("Unknown job class: {$class}");
+        }
+
+        /** @var self $job */
+        $job = new $class();
+
+        $job->id = $data['id'] ?? uniqid();
+        $job->jobErrors = $data['errors'] ?? [];
+        $job->jobLogs = $data['logs'] ?? [];
+
+        return $job;
+    }
 }
 
